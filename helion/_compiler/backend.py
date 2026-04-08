@@ -1346,15 +1346,21 @@ class PallasBackend(Backend):
                 if bid is not None and bid in known_block_ids:
                     bs = env.block_sizes[bid].from_config(config)
                     if isinstance(bs, int):
-                        # For 1D tensors, the block size must be a
-                        # multiple of the 1D tiling factor or equal to
-                        # the full dimension.  If neither holds, fall
-                        # back to no tiling for the entire kernel.
+                        # Check that the block size meets Pallas requirements:
+                        # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
+                        # If not, fall-back to no tiling for the entire kernel
                         dim_size = tensor.shape[d]
-                        if tensor.ndim == 1 and isinstance(dim_size, int):
-                            bitwidth = tensor.dtype.itemsize * 8
-                            tiling_1d = 128 * (32 // bitwidth)
-                            if bs != dim_size and bs % tiling_1d != 0:
+                        if isinstance(dim_size, int):
+                            required_alignment = 1
+                            if d == tensor.ndim - 1:
+                                if tensor.ndim == 1:
+                                    bitwidth = tensor.dtype.itemsize * 8
+                                    required_alignment = 128 * (32 // bitwidth)
+                                else:
+                                    required_alignment = 128
+                            elif d == tensor.ndim - 2:
+                                required_alignment = 8
+                            if bs != dim_size and bs % required_alignment != 0:
                                 return self._no_tiling_block_spec_info(sorted_args)
                         block_shape.append(bs)
                         # When the block covers the entire tensor
