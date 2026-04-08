@@ -191,10 +191,8 @@ def _pallas_index_str(
     pipeline_block_ids: set[int] = set()
     for loops in state.codegen.active_device_loops.values():
         for loop in loops:
-            if (
-                isinstance(loop, EmitPipelineLoopState)
-                or isinstance(loop, ForiLoopState)
-                and loop.use_dma
+            if isinstance(loop, EmitPipelineLoopState) or (
+                isinstance(loop, ForiLoopState) and loop.use_dma
             ):
                 in_pipeline = True
                 pipeline_block_ids.update(loop.block_ids)

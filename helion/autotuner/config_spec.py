@@ -481,8 +481,10 @@ class ConfigSpec:
             config.setdefault(key, fragment.default())
         if self.has_pallas_inner_loops:
             if self.has_pallas_symbolic_bounds:
-                # "default" uses Python range() which can't handle traced bounds;
-                # "fori_loop" handles both DMA and no-DMA cases gracefully.
+                # "default" uses Python range() which can't handle traced bounds.
+                # Between the remaining options, prefer "fori_loop": it handles
+                # both DMA-aligned and unaligned inner blocks, while
+                # "emit_pipeline" fails on unaligned dims.
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
@@ -789,9 +791,10 @@ class ConfigSpec:
         if self.has_pallas_inner_loops:
             choices = VALID_PALLAS_LOOP_TYPES
             if self.has_pallas_symbolic_bounds:
-                # "default" uses Python range() which can't handle traced bounds.
-                # Put "fori_loop" first: it handles both DMA-aligned and unaligned
-                # inner blocks, while "emit_pipeline" fails on unaligned dims.
+                # Exclude "default" (uses Python range(), can't handle traced
+                # bounds) and put "fori_loop" first: it handles both DMA-aligned
+                # and unaligned inner blocks, while "emit_pipeline" fails on
+                # unaligned dims.
                 choices = ("fori_loop", "emit_pipeline")
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
