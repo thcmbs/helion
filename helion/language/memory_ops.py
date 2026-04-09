@@ -235,7 +235,15 @@ def _pallas_index_str(
                     if symbol_origin and isinstance(symbol_origin.origin, GridOrigin):
                         parts.append(state.codegen.offset_var(block_id))
                     else:
-                        parts.append(_pallas_ds_expr(state, block_id, offset_expr))
+                        parent_bid = env.nested_tile_parent_id.get(block_id)
+                        parts.append(
+                            _pallas_ds_expr(
+                                state,
+                                block_id,
+                                offset_expr,
+                                subtract_parent_offset=parent_bid,
+                            )
+                        )
                 else:
                     maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
                     if maybe_grid_axis_idx is not None:
@@ -309,9 +317,114 @@ def _resolve_block_id(
     return None
 
 
-def _pallas_ds_expr(state: CodegenState, block_id: int, tile_offset: str) -> str:
-    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*"""
+def _get_tile_id_grid_block_id(
+    idx: torch.SymInt, env: CompileEnvironment
+) -> int | None:
+    """If *idx* originates from ``tile.id``, return the grid-level block_id."""
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    if origin_info is None or not isinstance(origin_info.origin, TileIdOrigin):
+        return None
+    block_id = origin_info.origin.block_id
+    # Resolve through nested tile parents to reach a grid-level block_id
+    while block_id in env.nested_tile_parent_id:
+        block_id = env.nested_tile_parent_id[block_id]
+    return block_id
+
+
+def _find_tile_id_in_subscript(
+    subscript: list[object] | tuple[object, ...],
+) -> int | None:
+    """If any element of *subscript* originates from ``tile.id``, return its block_id."""
+    env = CompileEnvironment.current()
+    for idx in subscript:
+        if isinstance(idx, torch.SymInt):
+            bid = _get_tile_id_grid_block_id(idx, env)
+            if bid is not None:
+                return bid
+    return None
+
+
+def _get_or_create_tile_id_scratch(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_name: str,
+    tile_id_bid: int,
+) -> str:
+    """Return the scratch variable for a ``.id``-indexed output tensor.
+
+    Allocates the scratch on first use and registers a deferred copy
+    that will be emitted at the end of the grid body (last CTA copies
+    scratch → output).
+    """
+    device_fn = state.device_function
+    tensor_id = id(tensor)
+
+    # Check if already allocated
+    existing = getattr(device_fn, "_tile_id_scratch_map", None)
+    if existing and tensor_id in existing:
+        return existing[tensor_id]
+
+    # Resolve the tensor shape to concrete ints for scratch allocation.
+    # The .id dimension is typically cdiv(total, block_size) — compute
+    # it from the config block_size to avoid symbolic shape issues.
+    env = CompileEnvironment.current()
+    config = device_fn.config
+    bs_info = env.block_sizes[tile_id_bid]
+    block_size = bs_info.from_config(config)
+    total = bs_info.size
+    if isinstance(total, torch.SymInt):
+        total = int(total)
+    assert isinstance(block_size, int) and isinstance(total, int)
+    num_tiles = -(-total // block_size)  # cdiv
+
+    # Build the concrete shape: replace the .id dim (dim 0) with num_tiles
+    concrete_shape: list[int] = [num_tiles]
+    for s in tensor.shape[1:]:
+        concrete_shape.append(int(s))
+
+    # Allocate a VMEM scratch with the same shape/dtype
+    scratch_name = device_fn.register_scratch(
+        shape=tuple(concrete_shape),
+        dtype=tensor.dtype,
+        name_hint="scratch_tile_id",
+        scratch_type="vmem",
+    )
+
+    # Prevent DCE from removing the output tensor arg — the deferred
+    # copy (added after DCE) writes to it.
+    device_fn.placeholder_args.add(tensor_name)
+
+    # Record the mapping
+    if not hasattr(device_fn, "_tile_id_scratch_map"):
+        device_fn._tile_id_scratch_map = {}
+    device_fn._tile_id_scratch_map[tensor_id] = scratch_name
+
+    # Record deferred copy info: (scratch_name, tensor_name, tile_id_bid)
+    if not hasattr(device_fn, "_tile_id_deferred_copies"):
+        device_fn._tile_id_deferred_copies = []
+    device_fn._tile_id_deferred_copies.append((scratch_name, tensor_name, tile_id_bid))
+
+    return scratch_name
+
+
+def _pallas_ds_expr(
+    state: CodegenState,
+    block_id: int,
+    tile_offset: str,
+    subtract_parent_offset: int | None = None,
+) -> str:
+    """Return a ``pl.ds(offset, block_size)`` expression for *block_id*, offset by *tile_offset*.
+
+    When *subtract_parent_offset* is set, the parent block's offset is
+    subtracted so the result is relative to the BlockSpec-sliced view.
+    """
     offset = state.codegen.offset_var(block_id)
+    if subtract_parent_offset is not None:
+        parent_offset = state.codegen.offset_var(subtract_parent_offset)
+        offset = f"{offset} - {parent_offset}"
     if tile_offset:
         offset = f"{offset} + {tile_offset}"
     block_size = state.device_function.block_size_var(block_id)
@@ -348,9 +461,23 @@ def _(state: CodegenState) -> None:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
     index_str, _ = _pallas_index_str(state, subscript, tensor)
-    state.codegen.add_statement(
-        statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
-    )
+
+    # Check if any subscript element uses tile.id — if so, redirect
+    # the store to a VMEM scratch buffer that persists across grid
+    # iterations (PrefetchScalarGridSpec output refs do NOT preserve
+    # cross-CTA writes).
+    tile_id_bid = _find_tile_id_in_subscript(subscript)
+    if tile_id_bid is not None:
+        scratch_name = _get_or_create_tile_id_scratch(state, tensor, name, tile_id_bid)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{scratch_name}[{index_str}] = {{value}}", value=value
+            )
+        )
+    else:
+        state.codegen.add_statement(
+            statement_from_string(f"{name}[{index_str}] = {{value}}", value=value)
+        )
 
 
 def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:

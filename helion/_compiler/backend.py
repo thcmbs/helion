@@ -1343,8 +1343,17 @@ class PallasBackend(Backend):
             grid_dims: list[int | tuple[int, int, int] | None] = []
             for d in range(tensor.ndim):
                 bid = dim_block_ids.get(d)
-                if bid is not None and bid in known_block_ids:
-                    bs = env.block_sizes[bid].from_config(config)
+                # If bid is an inner device loop block_id, resolve it to
+                # the parent grid-level block_id for BlockSpec purposes.
+                resolved_bid = bid
+                while (
+                    resolved_bid is not None
+                    and resolved_bid not in known_block_ids
+                    and resolved_bid in env.nested_tile_parent_id
+                ):
+                    resolved_bid = env.nested_tile_parent_id[resolved_bid]
+                if resolved_bid is not None and resolved_bid in known_block_ids:
+                    bs = env.block_sizes[resolved_bid].from_config(config)
                     if isinstance(bs, int):
                         # Check that the block size meets Pallas requirements:
                         # https://docs.jax.dev/en/latest/pallas/grid_blockspec.html
@@ -1370,10 +1379,10 @@ class PallasBackend(Backend):
                         # block_size > 1).
                         if isinstance(dim_size, int) and dim_size <= bs:
                             grid_dims.append(None)
-                        elif flat_decomp is not None and bid in flat_decomp:
-                            grid_dims.append(flat_decomp[bid])
+                        elif flat_decomp is not None and resolved_bid in flat_decomp:
+                            grid_dims.append(flat_decomp[resolved_bid])
                         else:
-                            grid_dims.append(block_id_to_grid_dim[bid])
+                            grid_dims.append(block_id_to_grid_dim[resolved_bid])
                         continue
                 block_shape.append(None)
                 grid_dims.append(None)

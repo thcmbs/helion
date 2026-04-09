@@ -290,6 +290,33 @@ def _normalize_begin_end(
     return begin, end
 
 
+def _record_nested_tile_parent(
+    begin_part: object,
+    end_part: object,
+    inner_block_id: int,
+) -> None:
+    """If begin/end originate from another tile's .begin/.end, record the
+    parent relationship so BlockSpec generation can map inner block_ids
+    back to grid-level block_ids."""
+    from .._compiler.compile_environment import _symint_expr
+    from .._compiler.host_function import HostFunction
+    from .._compiler.variable_origin import GridOrigin
+
+    for part in (begin_part, end_part):
+        if not isinstance(part, torch.SymInt):
+            continue
+        expr = _symint_expr(part)
+        if expr is None:
+            continue
+        origin_info = HostFunction.current().expr_to_origin.get(expr)
+        if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+            parent_block_id = origin_info.origin.block_id
+            CompileEnvironment.current().nested_tile_parent_id[inner_block_id] = (
+                parent_block_id
+            )
+            return
+
+
 @_decorators.type_propagation(tile)
 def _(
     begin_or_end: TypeInfo,
@@ -356,17 +383,19 @@ def _(
         if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
             has_symbolic_bounds = True
         if bs is None:
-            results.append(TileIndexType.allocate(size, origin))
+            result_tile = TileIndexType.allocate(size, origin)
         elif isinstance(bs, int):
-            results.append(TileIndexType.allocate(size, origin, bs))
+            result_tile = TileIndexType.allocate(size, origin, bs)
         elif isinstance(bs, torch.SymInt):
             env = CompileEnvironment.current()
             index = env.get_block_id(bs)
             if index is None:
-                results.append(TileIndexType.allocate(size, origin, bs))
+                result_tile = TileIndexType.allocate(size, origin, bs)
             else:
-                results.append(TileIndexType(origin=origin, block_id=index))
+                result_tile = TileIndexType(origin=origin, block_id=index)
                 env.block_sizes[index].mark_alternate_size(size)
+        _record_nested_tile_parent(begin_part, end_part, result_tile.block_id)
+        results.append(result_tile)
 
     _add_config_choices(
         [x.block_id for x in results],

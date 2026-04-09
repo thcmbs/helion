@@ -160,6 +160,7 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
         self.jagged_tile_parent_id: dict[int, int] = {}
+        self.nested_tile_parent_id: dict[int, int] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         self._symint_cache: dict[object, torch.SymInt] = {}
         self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}

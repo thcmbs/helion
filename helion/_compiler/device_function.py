@@ -734,6 +734,17 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        # Emit deferred tile_id scratch → output copies.
+        # With PrefetchScalarGridSpec, only the last CTA's output write
+        # survives — and its scratch contains all CTAs' data.
+        tile_id_copies: list[ast.stmt] = []
+        for scratch_name, tensor_name, _bid in getattr(
+            self, "_tile_id_deferred_copies", []
+        ):
+            tile_id_copies.append(
+                statement_from_string(f"{tensor_name}[...] = {scratch_name}[...]")
+            )
+
         return [
             *prefix,
             ast_rename(
@@ -745,6 +756,7 @@ class DeviceFunction:
                         *scalar_preamble,
                         *self.preamble,
                         *self.body,
+                        *tile_id_copies,
                     ],
                     decorator_list=[expr_from_string(backend.function_decorator)]
                     if backend.function_decorator

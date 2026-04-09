@@ -1037,6 +1037,47 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     loop_var = state.device_function.new_var("_j")
     body_stmts: list[ast.AST] = []
 
+    # Compute per-dimension index variables from the flat loop_var.
+    # When len(block_ids) > 1 the fori_loop iterates over the product of
+    # all tile counts, so we must unflatten into per-dim indices via divmod.
+    if len(block_ids) == 1:
+        dim_index_vars = [loop_var]
+    else:
+        dim_index_vars = [
+            state.device_function.new_var(f"_j_{i}") for i in range(len(block_ids))
+        ]
+        # Emit divmod decomposition: row-major order (last dim varies fastest)
+        remainder_var = loop_var
+        for i in range(len(block_ids)):
+            if i < len(block_ids) - 1:
+                # divisor = product of grid_parts[i+1:]
+                suffix = grid_parts[i + 1 :]
+                divisor = (
+                    suffix[0]
+                    if len(suffix) == 1
+                    else " * ".join(f"({p})" for p in suffix)
+                )
+                body_stmts.append(
+                    statement_from_string(
+                        f"{dim_index_vars[i]} = ({remainder_var}) // ({divisor})"
+                    )
+                )
+                if i < len(block_ids) - 2:
+                    new_remainder = state.device_function.new_var(f"_jr_{i}")
+                    body_stmts.append(
+                        statement_from_string(
+                            f"{new_remainder} = ({remainder_var}) % ({divisor})"
+                        )
+                    )
+                    remainder_var = new_remainder
+                else:
+                    body_stmts.append(
+                        statement_from_string(
+                            f"{dim_index_vars[i + 1]} = ({remainder_var}) % ({divisor})"
+                        )
+                    )
+            # last dim already handled by the else branch above
+
     # Build block_id_to_info
     block_id_to_info: dict[int, LoopDimInfo] = {}
     for block_id in block_ids:
@@ -1054,8 +1095,8 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         block_size_vars,
         env,
         body_stmts,
-        # fori_loop has direct access to the loop variable
-        offset_expr_fn=lambda i, bs: f"{loop_var} * {bs} + jnp.arange({bs})",
+        # fori_loop has direct access to the per-dimension loop variable
+        offset_expr_fn=lambda i, bs: f"{dim_index_vars[i]} * {bs} + jnp.arange({bs})",
     )
     # Create ForiLoopState
     fori_state = ForiLoopState(
@@ -1084,8 +1125,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 begin_expr = begin_exprs[bid_idx]
                 iter_step_expr = iter_step_exprs[bid_idx]
                 slice_size_expr = slice_size_exprs[bid_idx]
+                dim_var = dim_index_vars[bid_idx]
                 parts.append(
-                    f"pl.ds(({begin_expr}) + ({loop_var}) * ({iter_step_expr}), {slice_size_expr})"
+                    f"pl.ds(({begin_expr}) + ({dim_var}) * ({iter_step_expr}), {slice_size_expr})"
                 )
                 needs_slice = True
             elif bid is not None and bid not in block_ids:
@@ -1137,9 +1179,10 @@ def _codegen_fori_loop(state: CodegenState) -> object:
             # No DMA: emit offset assignments so pl.ds() indexing works
             for i, bid in enumerate(block_ids):
                 offset_name = strategy.offset_var(bid)
+                dim_var = dim_index_vars[i]
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + ({loop_var}) * ({iter_step_exprs[i]})"
+                        f"{offset_name} = ({begin_exprs[i]}) + ({dim_var}) * ({iter_step_exprs[i]})"
                     )
                 )
 
