@@ -26,6 +26,7 @@ from .stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
+    from helion._compiler.type_propagation import SymbolOrigin
 
 __all__ = ["load", "store"]
 
@@ -222,7 +223,11 @@ def _pallas_index_str(
             else:
                 loops = state.codegen.active_device_loops.get(block_id)
                 if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
-                    parts.append(_pallas_ds_expr(state, block_id, offset_expr))
+                    symbol_origin = _maybe_get_symbol_origin(idx)
+                    if symbol_origin and isinstance(symbol_origin.origin, GridOrigin):
+                        parts.append(state.codegen.offset_var(block_id))
+                    else:
+                        parts.append(_pallas_ds_expr(state, block_id, offset_expr))
                 else:
                     maybe_grid_axis_idx = _maybe_get_hl_grid_axis_pid(idx)
                     if maybe_grid_axis_idx is not None:
@@ -255,19 +260,23 @@ def _pallas_index_str(
     return ", ".join(parts), none_dims
 
 
-# returns pid for an idx (used in a index_expr) that comes from a hl.grid
-def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
+def _maybe_get_symbol_origin(idx: object) -> SymbolOrigin | None:
     if not isinstance(idx, torch.SymInt):
         return None
     expr = _symint_expr(idx)
     if expr is None:
         return None
-    origin_info = HostFunction.current().expr_to_origin.get(expr)
-    if origin_info is None:
+    return HostFunction.current().expr_to_origin.get(expr)
+
+
+# returns pid for an idx (used in a index_expr) that comes from a hl.grid
+def _maybe_get_hl_grid_axis_pid(idx: object) -> int | None:
+    symbol_origin = _maybe_get_symbol_origin(idx)
+    if symbol_origin is None:
         return None
-    if not isinstance(origin_info.origin, GridOrigin):
+    if not isinstance(symbol_origin.origin, GridOrigin):
         return None
-    block_id = origin_info.origin.block_id
+    block_id = symbol_origin.origin.block_id
     from .._compiler.device_function import DeviceFunction
 
     device_fn = DeviceFunction.current()
