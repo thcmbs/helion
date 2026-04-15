@@ -15,7 +15,10 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.rw = ReadWrites(
-            collections.Counter(), collections.Counter(), collections.Counter()
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
+            collections.Counter(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -48,6 +51,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             if isinstance(first_arg, ast.Name):
                 self.rw.writes[first_arg.id] += 1
                 self.rw.inplace_writes[first_arg.id] += 1
+                self.rw.atomic_writes[first_arg.id] += 1
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -67,6 +71,10 @@ class ReadWrites(typing.NamedTuple):
     # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
     # be updated to detect those as well.
     inplace_writes: dict[str, int]
+    # Subset of inplace_writes produced by hl.atomic_*(x, ...) calls.
+    # Used to decide which outputs need serialised (``"arbitrary"``) grid
+    # dimension semantics on the Pallas backend.
+    atomic_writes: dict[str, int]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})

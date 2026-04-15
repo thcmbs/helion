@@ -69,6 +69,33 @@ def split_k_atomic_add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def split_k_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Split-K reduction where each K-tile contributes its max via atomic_max."""
+    m, k = x.size()
+    out = torch.full([m], -1e30, dtype=x.dtype, device=x.device)
+    for tile_m, tile_k in hl.tile([m, k]):
+        block = x[tile_m, tile_k]
+        per_row = torch.amax(block, dim=1)
+        hl.atomic_max(out, [tile_m], per_row)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def split_k_multi_atomic_kernel(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two atomic outputs in one kernel, both needing the scratch accumulator."""
+    m, k = x.size()
+    sum_out = torch.zeros([m], dtype=x.dtype, device=x.device)
+    sumsq_out = torch.zeros([m], dtype=x.dtype, device=x.device)
+    for tile_m, tile_k in hl.tile([m, k]):
+        block = x[tile_m, tile_k]
+        hl.atomic_add(sum_out, [tile_m], torch.sum(block, dim=1))
+        hl.atomic_add(sumsq_out, [tile_m], torch.sum(block * block, dim=1))
+    return sum_out, sumsq_out
+
+
 @helion.kernel()
 def atomic_add_f32_into_bf16_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where value dtype (float32) differs from output (bfloat16)."""
@@ -363,6 +390,64 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             torch.bfloat16
         )
         torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
+
+    # Multi-cell atomic writes into a shared output tile work only on the
+    # fori_loop launcher today. The default and pipeline launchers race
+    # silently on HBM; xfailed below as living TODOs.
+    @onlyBackends(["pallas"])
+    def _run_split_k_atomic_max(self, loop_type: str | None) -> None:
+        m, k = 128, 512
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        kwargs = {"pallas_loop_type": loop_type} if loop_type else {}
+        _, result = code_and_output(
+            split_k_atomic_max_kernel,
+            (x,),
+            block_sizes=[32, 128],
+            **kwargs,
+        )
+        torch.testing.assert_close(result, torch.amax(x, dim=1))
+
+    @onlyBackends(["pallas"])
+    def test_split_k_atomic_max_fori(self):
+        self._run_split_k_atomic_max("fori_loop")
+
+    @onlyBackends(["pallas"])
+    @unittest.expectedFailure  # atomic wrapper breaks under emit_pipeline
+    def test_split_k_atomic_max_pipeline(self):
+        self._run_split_k_atomic_max("pipeline")
+
+    @onlyBackends(["pallas"])
+    @unittest.expectedFailure  # default launcher has no atomic wrapper; HBM race
+    def test_split_k_atomic_max_default(self):
+        self._run_split_k_atomic_max(None)
+
+    @onlyBackends(["pallas"])
+    def _run_split_k_multi_atomic(self, loop_type: str | None) -> None:
+        m, k = 128, 512
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.float32)
+        kwargs = {"pallas_loop_type": loop_type} if loop_type else {}
+        _, (sum_out, sumsq_out) = code_and_output(
+            split_k_multi_atomic_kernel,
+            (x,),
+            block_sizes=[32, 128],
+            **kwargs,
+        )
+        torch.testing.assert_close(sum_out, torch.sum(x, dim=1))
+        torch.testing.assert_close(sumsq_out, torch.sum(x * x, dim=1))
+
+    @onlyBackends(["pallas"])
+    def test_split_k_multi_atomic_outputs_fori(self):
+        self._run_split_k_multi_atomic("fori_loop")
+
+    @onlyBackends(["pallas"])
+    @unittest.expectedFailure  # atomic wrapper breaks under emit_pipeline
+    def test_split_k_multi_atomic_outputs_pipeline(self):
+        self._run_split_k_multi_atomic("pipeline")
+
+    @onlyBackends(["pallas"])
+    @unittest.expectedFailure  # default launcher has no atomic wrapper; HBM race
+    def test_split_k_multi_atomic_outputs_default(self):
+        self._run_split_k_multi_atomic(None)
 
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""

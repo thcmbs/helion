@@ -1468,12 +1468,19 @@ class PallasBackend(Backend):
         # These must use VMEM BlockSpecs. Output-only tensors (written but
         # never read) get HBM in_specs to avoid VMEM pressure.
         inplace_indices: list[int] = []
+        # Subset of output_indices whose writes come from hl.atomic_*(x, ...).
+        # Used by the Pallas launcher to set ``"arbitrary"`` dimension
+        # semantics for unmapped grid dims, serialising split-K cells.
+        atomic_indices: list[int] = []
+        atomic_names: set[str] = set()
         if sorted_args is not None:
             env = CompileEnvironment.current()
             host_fn = HostFunction.current()
-            mutated_params = set(ReadWrites.from_list(host_fn.body).inplace_writes) & {
+            host_rw = ReadWrites.from_list(host_fn.body)
+            mutated_params = set(host_rw.inplace_writes) & {
                 a.arg for a in host_fn.args.args
             }
+            atomic_names = set(host_rw.atomic_writes)
             input_storages = {id(t.untyped_storage()) for t in env.input_sources}
             # Collect reads from for-loop bodies only (kernel code), excluding
             # host-level reads like ``return out``.
@@ -1499,19 +1506,24 @@ class PallasBackend(Backend):
             for i, arg in enumerate(sorted_args):
                 if not isinstance(arg, TensorArg):
                     continue
+                name = arg.host_str()
                 if id(arg.fake_value.untyped_storage()) not in input_storages:
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
-                    if arg.host_str() in kernel_reads:
+                    if name in kernel_reads:
                         # Also read by the kernel (e.g. broadcast result)
                         inplace_indices.append(i)
-                elif arg.host_str() in mutated_params:
+                elif name in mutated_params:
                     # Input tensor mutated in-place
                     output_indices.append(i)
                     inplace_indices.append(i)
+                if name in atomic_names and i in output_indices:
+                    atomic_indices.append(i)
 
         launcher_args = [*args, f"_output_indices={output_indices}"]
         launcher_args.append(f"_inplace_indices={inplace_indices}")
+        if atomic_indices:
+            launcher_args.append(f"_atomic_indices={atomic_indices}")
 
         if has_rng_ops:
             launcher_args.insert(-1, "_rng_seed_buffer")
