@@ -567,6 +567,8 @@ def _(state: CodegenState) -> object:
     return _emit_pallas_matmul(
         lhs_ast,
         rhs_ast,
+        lhs_ndim=lhs_proxy.ndim,
+        rhs_ndim=rhs_proxy.ndim,
         acc=acc,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,

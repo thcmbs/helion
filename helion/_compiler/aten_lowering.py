@@ -1013,14 +1013,18 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
     assert isinstance(lhs_node_arg, Node)
     assert isinstance(rhs_node_arg, Node)
-    lhs_dtype = lhs_node_arg.meta["val"].dtype
-    rhs_dtype = rhs_node_arg.meta["val"].dtype
+    lhs_val = lhs_node_arg.meta["val"]
+    rhs_val = rhs_node_arg.meta["val"]
+    lhs_dtype = lhs_val.dtype
+    rhs_dtype = rhs_val.dtype
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
     return _emit_pallas_matmul(
         lhs,
         rhs,
+        lhs_ndim=lhs_val.ndim,
+        rhs_ndim=rhs_val.ndim,
         acc=acc if with_acc else None,
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,

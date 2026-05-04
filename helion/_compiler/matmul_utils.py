@@ -135,39 +135,38 @@ def _emit_pallas_matmul(
     lhs: ast.AST,
     rhs: ast.AST,
     *,
+    lhs_ndim: int,
+    rhs_ndim: int,
     acc: ast.AST | None = None,
     need_f32_acc: bool = False,
     out_dtype: torch.dtype | None = None,
 ) -> ast.AST:
-    """Build a ``jnp.matmul`` AST node for the Pallas backend.
+    """Build a ``lax.dot_general`` AST node for the Pallas backend.
 
-    Parameters
-    ----------
-    lhs, rhs:
-        AST nodes for the left / right operands.
-    acc:
-        Optional AST node for the accumulator (``acc + matmul(...)``).
-    need_f32_acc:
-        When True, emit ``preferred_element_type=jnp.float32`` and, if
-        *out_dtype* is narrower than f32, append a
-        ``lax.convert_element_type`` cast.
-    out_dtype:
-        Desired output dtype.  Only used when *need_f32_acc* is True to
-        decide whether a cast-back is required.
+    Avoids ``jnp.matmul`` because for ndim>=3 inputs the Mosaic lowering
+    emits squeeze + 2D ``tpu.matmul`` + ``tpu.transpose``; the transpose
+    is a real VMEM lane shuffle that costs significant perf when there
+    are multiple matmuls per kernel.  Explicit dim_numbers produce the
+    correct output shape directly.
     """
-    if need_f32_acc:
-        dot_expr = expr_from_string(
-            "jnp.matmul({lhs}, {rhs}, preferred_element_type=jnp.float32)",
-            lhs=lhs,
-            rhs=rhs,
+    if lhs_ndim != rhs_ndim or lhs_ndim < 2:
+        raise NotImplementedError(
+            f"Pallas matmul codegen requires matching ndim>=2 operands; "
+            f"got lhs_ndim={lhs_ndim}, rhs_ndim={rhs_ndim}"
         )
-    else:
-        dot_expr = expr_from_string("jnp.matmul({lhs}, {rhs})", lhs=lhs, rhs=rhs)
+    n = lhs_ndim
+    batch = tuple(range(n - 2))
+    dim_numbers = (((n - 1,), (n - 2,)), (batch, batch))
+    pref = ", preferred_element_type=jnp.float32" if need_f32_acc else ""
+    dot_expr = expr_from_string(
+        f"lax.dot_general({{lhs}}, {{rhs}}, {dim_numbers!r}{pref})",
+        lhs=lhs,
+        rhs=rhs,
+    )
 
     if acc is not None:
         dot_expr = expr_from_string("{acc} + {dot}", acc=acc, dot=dot_expr)
 
-    # Cast back if the result should be narrower than f32
     if need_f32_acc and out_dtype is not None and out_dtype.itemsize < 4:
         env = CompileEnvironment.current()
         dtype_str = env.backend.dtype_str(out_dtype)
