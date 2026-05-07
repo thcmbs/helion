@@ -32,7 +32,8 @@ def load_expr(
     patterns = state.fx_node.meta.get("indexing_patterns") or ()
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
-            return emit_gather(state, pattern.plan, name)
+            table_idx_str, _ = index_str(state, subscript, tensor)
+            return emit_gather(state, pattern.plan, name, table_idx_str)
 
     idx_str, none_dims = index_str(state, subscript, tensor)
     mask_expr = _load_mask_expr(state, subscript, tensor)
@@ -238,9 +239,15 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import IndirectGatherPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
+
+    if isinstance(pattern, IndirectGatherPattern):
+        # Indirect axis: full extent for the one_hot @ table contraction
+        # (the actual gather indices are applied in emit_gather).
+        return ":"
 
     if isinstance(pattern, TilePattern):
         return _tile_pattern_code(

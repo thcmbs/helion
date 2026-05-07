@@ -1601,7 +1601,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=3,
         )
 
-    @xfailIfPallas("BackendError on pallas")
     @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
@@ -1613,6 +1612,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         def expected(w, idx, x):
             return w[idx].to(x.dtype) @ x
 
+        # atol=0.2 covers TPU MXU bf16 truncation in the inner fp32 matmul;
+        # other backends compute fp32 exactly and pass comfortably.
         check_example(
             "gather_gemv",
             args,
@@ -1622,6 +1623,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16],
             num_warps=8,
             num_stages=1,
+            atol=0.2,
         )
 
     @xfailIfCute("CuTe int4 GEMM example is not supported yet")

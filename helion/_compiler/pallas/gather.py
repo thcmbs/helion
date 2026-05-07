@@ -54,9 +54,9 @@ def build_gather_plan(
         raise NotImplementedError(
             "Pallas gather: only dim-0 indirect indexing is supported"
         )
-    if not tensor.dtype.is_floating_point:
+    if tensor.dtype == torch.bool or tensor.dtype.is_complex:
         raise NotImplementedError(
-            f"Pallas gather: table must be floating point, got {tensor.dtype}"
+            f"Pallas gather: bool/complex tables are not supported, got {tensor.dtype}"
         )
 
     elements = resident_block_elements(tensor, patterns, config)
@@ -93,14 +93,20 @@ def emit_gather(
     state: CodegenState,
     plan: GatherPlan,
     name: str,
+    table_idx_str: str = "...",
 ) -> ast.AST:
     """Emit ``one_hot(idx, V) @ table``.
 
     MXU accumulates in fp32 via ``preferred_element_type``. fp32 tables need
     HIGHEST and fp32 one_hot; bf16/fp16 stay in the table dtype (MXU truncation
-    is a no-op and we avoid a VMEM upcast).
+    is a no-op and we avoid a VMEM upcast). Integer tables are upcast to fp32
+    for the matmul and cast back to the table dtype.
 
     Contracting dim is ``jnp.ndim(idx)``: one_hot adds one trailing axis.
+
+    ``table_idx_str`` is the per-axis slice for the table; the indirect axis
+    appears as ``:`` so the full gather axis is contracted, while other axes
+    pick up their tile slices.
     """
     ast_subscripts = state.ast_args[1]
     assert isinstance(ast_subscripts, list)
@@ -110,11 +116,11 @@ def emit_gather(
 
     if plan.use_highest_precision:
         oh_dtype = "jnp.float32"
-        table_expr = f"{name}[...].astype(jnp.float32)"
+        table_expr = f"{name}[{table_idx_str}].astype(jnp.float32)"
         precision_arg = "precision=jax.lax.Precision.HIGHEST, "
     else:
         oh_dtype = plan.jnp_dtype
-        table_expr = f"{name}[...]"
+        table_expr = f"{name}[{table_idx_str}]"
         precision_arg = ""
 
     result = expr_from_string(

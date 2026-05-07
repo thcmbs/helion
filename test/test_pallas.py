@@ -2508,8 +2508,9 @@ class TestPallasIndirectGather(TestCase):
         indices = torch.randint(0, 8192, (256,), device=DEVICE, dtype=torch.int32)
         code_and_output(gather, (indices, table), block_sizes=[128, 256])
 
-    def test_gather_integer_table_rejected(self) -> None:
-        """Gather on non-floating tables raises at plan time."""
+    def test_gather_integer_table(self) -> None:
+        """Integer tables go through fp32 matmul and round-trip exactly when
+        values fit in the fp32 mantissa."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
@@ -2524,7 +2525,30 @@ class TestPallasIndirectGather(TestCase):
 
         table = torch.randint(0, 100, (16, 64), device=DEVICE, dtype=torch.int32)
         indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(Exception, "must be floating point"):
+        code, result = code_and_output(
+            gather, (indices, table), block_sizes=[128, 64]
+        )
+        self.assertIn("one_hot", code)
+        ref = table.cpu()[indices.long().cpu()].to(device=DEVICE)
+        torch.testing.assert_close(result, ref)
+
+    def test_gather_bool_table_rejected(self) -> None:
+        """Boolean tables don't have a meaningful one_hot @ table lowering."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def gather(indices: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [indices.size(0), table.size(1)],
+                dtype=table.dtype,
+                device=table.device,
+            )
+            for tile_b, tile_e in hl.tile([indices.size(0), table.size(1)]):
+                out[tile_b, tile_e] = table[indices[tile_b], tile_e]
+            return out
+
+        table = torch.zeros(16, 64, device=DEVICE, dtype=torch.bool)
+        indices = torch.randint(0, 16, (256,), device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(Exception, "bool/complex"):
             code_and_output(gather, (indices, table), block_sizes=[128, 64])
 
     def test_scatter_raises(self) -> None:
