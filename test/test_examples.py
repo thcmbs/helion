@@ -1219,21 +1219,28 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfCute("CuTe LayerNorm backward example still returns incorrect results")
-    @xfailIfPallas("InductorLoweringError")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
 
-        cases = (
+        cases = [
             {
                 "batch_size": 32,
                 "dim": 64,
             },
             {
-                "batch_size": 1152 * 1000,
-                "dim": 16,
+                "batch_size": 32,
+                "dim": 10240,
             },
-        )
+        ]
+        if _get_backend() != "pallas":
+            cases.insert(
+                1,
+                {
+                    "batch_size": 1152 * 1000,
+                    "dim": 16,
+                },
+            )
 
         eps = 1e-4
         atol = 3e-2
@@ -1276,13 +1283,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
 
             args = (grad_out, x, mean, rstd, weight, True)
+            block_sizes = [128, 1] if _get_backend() == "pallas" else [32, 1]
 
             check_example(
                 "layer_norm",
                 args,
                 expected,
                 fn_name="layer_norm_bwd",
-                block_sizes=[32, 1],
+                block_sizes=block_sizes,
                 num_warps=4,
                 num_stages=3,
                 rtol=rtol,

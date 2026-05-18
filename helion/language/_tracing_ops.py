@@ -20,6 +20,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.dtype_utils import cast_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.variable_origin import BlockSizeOrigin
+from .._utils import next_power_of_2
 from ..exc import BackendUnsupported
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -474,7 +475,12 @@ def _scratch_write_stmt(state: CodegenState, sname: str, val: ast.AST) -> ast.AS
     # Always dereference source -- it may be a scratch ref
     if isinstance(val, ast.Name):
         src_sl = state.device_function.scratch_read_slice(val.id)
-        val = expr_from_string(f"{val.id}[{src_sl}]" if src_sl else f"{val.id}[...]")
+        if src_sl:
+            val = expr_from_string(f"{val.id}[{src_sl}]")
+        elif sl:
+            val = expr_from_string(f"{val.id}[{sl}]")
+        else:
+            val = expr_from_string(f"{val.id}[...]")
     return statement_from_string(f"{sname}[{idx}] = {{val}}", val=val)
 
 
@@ -496,11 +502,77 @@ def _resolve_shape(
     return tuple(resolved)
 
 
+def _resolve_logical_shape(
+    proxy: torch.Tensor,
+    env: CompileEnvironment,
+    config: Config,
+) -> tuple[int, ...]:
+    """Resolve the live extent of a tiled tensor, excluding backend padding."""
+    logical_shape = getattr(proxy, "_helion_logical_shape", None)
+    if logical_shape is not None:
+        return tuple(logical_shape)
+
+    resolved = []
+    for s in proxy.shape:
+        bid = env.resolve_block_id(s)
+        if bid is not None:
+            info = env.block_sizes[bid]
+            if isinstance(info.size, (int, torch.SymInt)):
+                bs = env.size_hint(info.size)
+            else:
+                bs = info.from_config(config)
+            assert isinstance(bs, int)
+            resolved.append(bs)
+        else:
+            resolved.append(int(s))
+    return tuple(resolved)
+
+
+def _infer_padded_loop_carried_shape(
+    shape: tuple[int, ...],
+    block_ids: list[int],
+    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    env: CompileEnvironment,
+) -> tuple[int, ...] | None:
+    """Infer live extents for padded loop-carried state from loop tensor dims."""
+    inferred: list[int] = []
+    changed = False
+    tensor_info = [*loaded_tensors.values(), *stored_tensors.values()]
+
+    for physical in shape:
+        candidates: set[int] = set()
+        for fake, _tensor_node, sub_meta in tensor_info:
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            for dim_idx, size in enumerate(fake.shape):
+                if dim_to_bid.get(dim_idx) in block_ids:
+                    continue
+                size_hint = (
+                    env.size_hint(size) if isinstance(size, torch.SymInt) else int(size)
+                )
+                if 0 < size_hint < physical and next_power_of_2(size_hint) == physical:
+                    candidates.add(size_hint)
+        if len(candidates) == 1:
+            inferred.append(next(iter(candidates)))
+            changed = True
+        else:
+            inferred.append(physical)
+
+    return tuple(inferred) if changed else None
+
+
 def _setup_loop_carried_state(
     state: CodegenState,
     args: list[ast.AST],
     proxy_args: list[object],
     env: CompileEnvironment,
+    block_ids: list[int] | None = None,
+    loaded_tensors: (
+        dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] | None
+    ) = None,
+    stored_tensors: (
+        dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] | None
+    ) = None,
 ) -> tuple[list[str], list[object], set[int]]:
     """Set up scratch VMEM buffers for loop-carried state.
 
@@ -520,9 +592,24 @@ def _setup_loop_carried_state(
         if isinstance(proxy, torch.Tensor):
             assert isinstance(arg_ast, ast.Name)
             shape = _resolve_shape(proxy, env, state.config)
+            logical_shape = _resolve_logical_shape(proxy, env, state.config)
+            if logical_shape == shape:
+                logical_shape = (
+                    _infer_padded_loop_carried_shape(
+                        shape,
+                        block_ids,
+                        loaded_tensors,
+                        stored_tensors,
+                        env,
+                    )
+                    if block_ids is not None
+                    and loaded_tensors is not None
+                    and stored_tensors is not None
+                    else None
+                )
             dtype = proxy.dtype
             scratch_name = state.device_function.register_scratch(
-                shape, dtype, name_hint=f"scratch_{i}"
+                shape, dtype, name_hint=f"scratch_{i}", logical_shape=logical_shape
             )
             # Initialize scratch with the arg value.
             state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
@@ -988,6 +1075,8 @@ def _apply_pre_broadcast_to_scratch(
         for sa in state.device_function._scratch_args:
             if sa.name == sname:
                 sa.shape = (*sa.shape, PRE_BROADCAST_SIZE)
+                if sa.logical_shape is not None:
+                    sa.logical_shape = (*sa.logical_shape, PRE_BROADCAST_SIZE)
                 modified_scratches.add(sname)
                 # If scratch != arg, the init `scratch[...] = arg[...]` was
                 # emitted without the trailing dim. Rewrite it to broadcast.
@@ -1434,7 +1523,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
     all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
     )
 
     # Build in_specs and out_specs
@@ -1558,7 +1652,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     carried: set[int] = set()
     if has_loop_state:
         scratch_names, result_vars, carried = _setup_loop_carried_state(
-            state, args, proxy_args, env
+            state, args, proxy_args, env, block_ids, loaded_tensors, stored_tensors
         )
 
     # --- Pre-broadcast transform: append PRE_BROADCAST_SIZE to scratch shapes
@@ -1924,7 +2018,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     carried: set[int] = set()
     if has_loop_state:
         scratch_names, result_vars, carried = _setup_loop_carried_state(
-            state, args, proxy_args, env
+            state, args, proxy_args, env, block_ids, loaded_tensors, stored_tensors
         )
 
     # --- Pre-broadcast transform (same as emit_pipeline) ---
@@ -1947,7 +2041,12 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loaded_tensors,
+        stored_tensors,
+        block_ids,
+        slice_size_exprs,
+        env,
+        state,
     )
 
     from .._compiler.device_function import PallasMemorySpace
