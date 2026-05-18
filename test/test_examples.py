@@ -1283,14 +1283,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
 
             args = (grad_out, x, mean, rstd, weight, True)
-            block_sizes = [128, 1] if _get_backend() == "pallas" else [32, 1]
 
             check_example(
                 "layer_norm",
                 args,
                 expected,
                 fn_name="layer_norm_bwd",
-                block_sizes=block_sizes,
+                block_sizes=[32, 128],
                 num_warps=4,
                 num_stages=3,
                 rtol=rtol,

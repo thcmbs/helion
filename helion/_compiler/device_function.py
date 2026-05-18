@@ -531,7 +531,6 @@ class ScratchArg:
     shape: tuple[int, ...]
     dtype: torch.dtype | None  # None for semaphores
     scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
-    logical_shape: tuple[int, ...] | None = None
 
 
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
@@ -1516,7 +1515,6 @@ class DeviceFunction:
         dtype: torch.dtype | None,
         name_hint: str = "scratch",
         scratch_type: str = "vmem",
-        logical_shape: tuple[int, ...] | None = None,
     ) -> str:
         """Register a scratch memory buffer and return its variable name."""
         if CompileEnvironment.current().backend_name != "pallas":
@@ -1524,9 +1522,7 @@ class DeviceFunction:
                 "register_scratch is only supported by the Pallas backend"
             )
         name = self.new_var(name_hint)
-        self._scratch_args.append(
-            ScratchArg(name, shape, dtype, scratch_type, logical_shape)
-        )
+        self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
         return name
 
     def scratch_read_slice(self, name: str) -> str | None:
@@ -1534,19 +1530,6 @@ class DeviceFunction:
 
         Returns None if no padding was applied.
         """
-        for scratch_arg in self._scratch_args:
-            if scratch_arg.name != name:
-                continue
-            logical_shape = scratch_arg.logical_shape
-            if logical_shape is None or logical_shape == scratch_arg.shape:
-                return None
-            assert len(logical_shape) == len(scratch_arg.shape)
-            return ", ".join(
-                ":" if logical == physical else f":{logical}"
-                for logical, physical in zip(
-                    logical_shape, scratch_arg.shape, strict=True
-                )
-            )
         return None
 
     def register_dma_semaphore(self, name_hint: str = "sem") -> str:
