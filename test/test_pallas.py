@@ -910,6 +910,9 @@ class TestPallas(TestCase):
         self.assertIn("pl.BlockSpec((1, 1,", code)
         self.assertIn("// 8", code)
         self.assertIn("% 8", code)
+        self.assertIn("out_vmem[0, 0,", code)
+        expected = (x + 1.0).reshape(batch, heads, M, D)
+        torch.testing.assert_close(result, expected)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
         """Invalid pallas_loop_type values must raise instead of silently falling back."""

@@ -261,6 +261,8 @@ def _generated_index_code(
     if isinstance(pattern, ArbitraryIndexPattern):
         if isinstance(idx, int):
             return str(idx)
+        if in_pipeline and _is_grid_derived_index(idx):
+            return "0"
         return _index_expr_from_ast(state, subscript_index)
 
     raise RuntimeError(
@@ -354,6 +356,25 @@ def _tile_begin_with_offset_pattern_code(
         return offset
 
     return f"{pattern.offset}"
+
+
+def _is_grid_derived_index(idx: object) -> bool:
+    """Return True if *idx* is a SymInt whose expression depends on a grid variable."""
+    if not isinstance(idx, torch.SymInt):
+        return False
+    from helion._compiler.compile_environment import _symint_expr
+    from helion._compiler.variable_origin import GridOrigin
+    from helion.language._tracing_ops import HostFunction
+
+    expr = _symint_expr(idx)
+    if expr is None:
+        return False
+    host_fn = HostFunction.current()
+    for sym in expr.free_symbols:
+        origin_info = host_fn.expr_to_origin.get(sym)
+        if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+            return True
+    return False
 
 
 def _index_expr_from_ast(state: CodegenState, subscript_index: int) -> str:
