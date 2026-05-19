@@ -335,6 +335,72 @@ def _get_dim_block_ids(
     return dim_to_bid
 
 
+def _grid_derived_lambda_expr(
+    subscript_meta: list[object] | tuple[object, ...],
+    dim_idx: int,
+    env: CompileEnvironment,
+    bid_to_pid_var: dict[int, str],
+    state: CodegenState,
+) -> str | None:
+    """Return a lambda expression string if subscript_meta[dim_idx] is derived
+    from a grid variable (e.g. ``bh // heads``).
+
+    When a dimension is indexed by an expression that depends on a grid
+    variable, the emit_pipeline BlockSpec must tile that dimension with
+    block_size=1 and use the expression (in terms of ``pl.program_id``)
+    as the lambda index.  Otherwise the full tensor dimension is used,
+    causing every program to read/modify/write the same oversized block
+    and corrupting other programs' data on write-back.
+    """
+    if not isinstance(subscript_meta, (list, tuple)):
+        return None
+    if dim_idx >= len(subscript_meta):
+        return None
+    idx = subscript_meta[dim_idx]
+    if not isinstance(idx, torch.SymInt):
+        return None
+
+    from .._compiler.compile_environment import _symint_expr
+    from .._compiler.variable_origin import GridOrigin
+
+    expr = _symint_expr(idx)
+    if expr is None:
+        return None
+
+    host_fn = HostFunction.current()
+    grid_sym = None
+    grid_bid = None
+    for sym in expr.free_symbols:
+        origin_info = host_fn.expr_to_origin.get(sym)
+        if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
+            grid_sym = sym
+            grid_bid = origin_info.origin.block_id
+            break
+
+    if grid_sym is None or grid_bid is None:
+        return None
+
+    pid_var = bid_to_pid_var.get(grid_bid)
+    if pid_var is None:
+        return None
+
+    from .._compiler.compile_environment import shape_env_size_hint
+    from .._compiler.device_function import pallas_texpr
+
+    subs: dict[sympy.Symbol, sympy.Expr] = {}
+    for sym in expr.free_symbols:
+        if sym is grid_sym:
+            subs[sym] = sympy.Symbol(pid_var)
+        else:
+            try:
+                val = shape_env_size_hint(env.shape_env, sym)
+                subs[sym] = sympy.Integer(val)
+            except Exception:
+                return None
+    replaced = expr.xreplace(subs)
+    return pallas_texpr(replaced)
+
+
 def _find_strategy(
     state: CodegenState,
     block_ids: list[int],
@@ -1509,11 +1575,23 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 if bs_var:
                     block_shape_parts.append(bs_var)
                 else:
-                    block_shape_parts.append(str(int(shape[dim_idx])))
+                    # Grid dims always have block_size=1
+                    block_shape_parts.append("1")
                 lambda_parts.append(pid_var)
             else:
-                block_shape_parts.append(str(int(shape[dim_idx])))
-                lambda_parts.append("0")
+                # Check if this dim is indexed by an expression derived from
+                # a grid variable (e.g. b = bh // heads).  If so, use
+                # block_size=1 and include the expression in the lambda so
+                # each program only reads/writes its own slice.
+                grid_expr = _grid_derived_lambda_expr(
+                    subscript_meta, dim_idx, env, _bid_to_pid_var, state
+                )
+                if grid_expr is not None:
+                    block_shape_parts.append("1")
+                    lambda_parts.append(grid_expr)
+                else:
+                    block_shape_parts.append(str(int(shape[dim_idx])))
+                    lambda_parts.append("0")
 
         block_shape_str = ", ".join(block_shape_parts)
         lambda_body = ", ".join(lambda_parts)
@@ -1741,7 +1819,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"pltpu.emit_pipeline({body_fn_name}, grid=({grid_str},))({call_args_str})"
         )
 
-    # Emit the function def and pipeline call into the current scope
+    for stmt in pipeline_state.outer_prefix:
+        state.add_statement(stmt)
     state.add_statement(fn_def)
     state.add_statement(statement_from_string(pipeline_call_str))
 

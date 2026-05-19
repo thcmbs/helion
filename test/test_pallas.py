@@ -440,6 +440,23 @@ def pallas_chunked_add(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_grid_derived_output(
+    x: torch.Tensor, batch: int, heads: int
+) -> torch.Tensor:
+    """Write to a 4D output using indices derived from a flat grid variable."""
+    N = x.size(0)
+    M = x.size(1)
+    D = x.size(2)
+    out = torch.empty([batch, heads, M, D], dtype=x.dtype, device=x.device)
+    for i in hl.grid(N):
+        b = i // heads
+        h = i % heads
+        for tile_m in hl.tile(M):
+            out[b, h, tile_m, :] = x[i, tile_m, :] + 1.0
+    return out
+
+
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
@@ -876,6 +893,23 @@ class TestPallas(TestCase):
         self.assertIn("pltpu.emit_pipeline", code)
         self.assertIn("_pipeline_arg_indices=", code)
         torch.testing.assert_close(result, expected)
+
+    def test_grid_derived_output_blockspec(self) -> None:
+        """Output indexed by grid-derived expressions (i//H, i%H) must use
+        block_size=1 per derived dim and the correct lambda expression."""
+        batch, heads, M, D = 4, 8, 128, 128
+        N = batch * heads
+        x = torch.randn(N, M, D, device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(
+            pallas_grid_derived_output,
+            (x, batch, heads),
+            block_sizes=[32],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("pl.BlockSpec((1, 1,", code)
+        self.assertIn("// 8", code)
+        self.assertIn("% 8", code)
 
     def test_invalid_pallas_loop_type_raises(self) -> None:
         """Invalid pallas_loop_type values must raise instead of silently falling back."""
