@@ -12,6 +12,7 @@ This example demonstrates how to implement a scaled dot-product attention using 
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable
 
 import torch
@@ -24,7 +25,18 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+_FP8_ATTENTION_CONFIG = (
+    helion.Config(
+        block_sizes=[32, 128],
+        pallas_loop_type="unroll",
+        pallas_pre_broadcast=False,
+    )
+    if os.environ.get("HELION_BACKEND") == "pallas"
+    else None
+)
+
+
+@helion.kernel(static_shapes=True, config=_FP8_ATTENTION_CONFIG)
 def fp8_attention_kernel(
     q: torch.Tensor,  # [batch*heads, seq, dim]
     k: torch.Tensor,  # [batch*heads, seq, dim]
@@ -296,7 +308,7 @@ def main() -> None:
     Tests with small, medium, and large attention configurations.
     """
     # TODO(adam-smnk): generalize to XPU
-    assert DEVICE.type == "cuda", "Requires CUDA device"
+    assert DEVICE.type in ("cuda", "tpu"), "Requires CUDA or TPU device"
     check(1, 2, 128, 64)
     check(2, 4, 256, 64)
     check(4, 8, 512, 128)
