@@ -45,6 +45,12 @@ SIGN_BIT32 = 1 << 31
 INT32_MAX = (1 << 31) - 1
 
 
+def _rng_int_dtype() -> torch.dtype:
+    if CompileEnvironment.current().backend.name == "pallas":
+        return torch.int32
+    return torch.int64
+
+
 def _pallas_safe_i32_scalar_like(
     ref: torch.Tensor,
     value: int,
@@ -77,15 +83,14 @@ def _shape_dim_index(
     from .tile_ops import tile_index
 
     env = CompileEnvironment.current()
+    dtype = _rng_int_dtype()
     if env.get_block_id(dim) is not None:
         assert isinstance(dim, torch.SymInt)
-        return _convert_element_type(
-            tile_index(cast("TileInterface", dim)), torch.int64
-        )  # pyrefly: ignore[bad-argument-type]
+        return _convert_element_type(tile_index(cast("TileInterface", dim)), dtype)  # pyrefly: ignore[bad-argument-type]
     if isinstance(dim, int):
-        return torch.arange(dim, device=device, dtype=torch.int64)
+        return torch.arange(dim, device=device, dtype=dtype)
     # pyrefly: ignore[no-matching-overload]
-    return torch.arange(dim, device=device, dtype=torch.int64)
+    return torch.arange(dim, device=device, dtype=dtype)
 
 
 def _explicit_offset_from_shape(
@@ -94,7 +99,7 @@ def _explicit_offset_from_shape(
     device: torch.device,
 ) -> torch.Tensor:
     if not shape:
-        return torch.arange(1, device=device, dtype=torch.int64).reshape([]) * 0
+        return torch.arange(1, device=device, dtype=_rng_int_dtype()).reshape([]) * 0
 
     extents: list[_ShapeDim] = [_shape_dim_extent(dim) for dim in shape]
     indices = [_shape_dim_index(dim, device=device) for dim in shape]
@@ -154,24 +159,25 @@ def _ref_rng_shape_and_offset(
     return processed_shape, offset
 
 
-def _as_int64_scalar(
+def _as_rng_int_scalar(
     value: int | torch.SymInt | torch.Tensor, *, device: torch.device
 ) -> torch.Tensor:
+    dtype = _rng_int_dtype()
     if isinstance(value, torch.Tensor):
-        return _convert_element_type(value, torch.int64)
+        return _convert_element_type(value, dtype)
     if isinstance(value, torch.SymInt):
-        return torch.scalar_tensor(cast("int", value), dtype=torch.int64, device=device)
-    return torch.scalar_tensor(value, dtype=torch.int64, device=device)
+        return torch.scalar_tensor(cast("int", value), dtype=dtype, device=device)
+    return torch.scalar_tensor(value, dtype=dtype, device=device)
 
 
-def _uint32_to_signed_int64(x: torch.Tensor) -> torch.Tensor:
-    x64 = _convert_element_type(x, torch.int64)
-    sign_bit32 = _pallas_safe_i32_scalar_like(x64, SIGN_BIT32)
-    return _mask_u32(x64 + sign_bit32) - sign_bit32
+def _uint32_to_signed_rng_int(x: torch.Tensor) -> torch.Tensor:
+    x_int = _convert_element_type(x, _rng_int_dtype())
+    sign_bit32 = _pallas_safe_i32_scalar_like(x_int, SIGN_BIT32)
+    return _mask_u32(x_int + sign_bit32) - sign_bit32
 
 
 def _uint32_to_uniform_float(x: torch.Tensor) -> torch.Tensor:
-    signed = _uint32_to_signed_int64(x)
+    signed = _uint32_to_signed_rng_int(x)
     magnitude = torch.where(signed < 0, -signed - 1, signed)
     return _convert_element_type(magnitude, torch.float32) * UINT32_TO_UNIFORM_SCALE
 
@@ -184,12 +190,13 @@ def _mulhi_lo_u32(
     a: int | torch.Tensor,
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    a64 = _convert_element_type(a, torch.int64) if isinstance(a, torch.Tensor) else a
-    b64 = _convert_element_type(b, torch.int64)
-    a0 = a64 & HALF_MASK16
-    a1 = (a64 >> 16) & HALF_MASK16
-    b0 = b64 & HALF_MASK16
-    b1 = (b64 >> 16) & HALF_MASK16
+    dtype = _rng_int_dtype()
+    a_int = _convert_element_type(a, dtype) if isinstance(a, torch.Tensor) else a
+    b_int = _convert_element_type(b, dtype)
+    a0 = a_int & HALF_MASK16
+    a1 = (a_int >> 16) & HALF_MASK16
+    b0 = b_int & HALF_MASK16
+    b1 = (b_int >> 16) & HALF_MASK16
 
     t = a0 * b0
     w0 = t & HALF_MASK16
@@ -210,15 +217,15 @@ def _philox_uint32x4(
     offset: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = offset.device
-    offset64 = _convert_element_type(offset, torch.int64)
-    seed64 = _as_int64_scalar(seed, device=device)
+    offset_int = _convert_element_type(offset, _rng_int_dtype())
+    seed_int = _as_rng_int_scalar(seed, device=device)
 
-    c0 = _mask_u32(offset64)
-    c1 = _mask_u32(offset64 >> 32)
+    c0 = _mask_u32(offset_int)
+    c1 = _mask_u32(offset_int >> 32)
     c2 = c0 * 0
     c3 = c0 * 0
-    k0 = _mask_u32(seed64)
-    k1 = _mask_u32(seed64 >> 32)
+    k0 = _mask_u32(seed_int)
+    k1 = _mask_u32(seed_int >> 32)
 
     for _ in range(PHILOX_ROUNDS):
         hi0, lo0 = _mulhi_lo_u32(PHILOX_ROUND_B, c2)
@@ -264,7 +271,7 @@ def _philox_randint_from_seed_and_offset(
     if low >= high:
         raise ValueError(f"low ({low}) must be less than high ({high})")
     c0, _, _, _ = _philox_uint32x4(seed, offset)
-    signed = _uint32_to_signed_int64(c0)
+    signed = _uint32_to_signed_rng_int(c0)
     magnitude = torch.where(signed < 0, -signed, signed)
     return _convert_element_type(low + (magnitude % (high - low)), torch.int32)
 

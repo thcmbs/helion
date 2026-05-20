@@ -47,6 +47,11 @@ def _assert_uses_philox(testcase: TestCase, code: str) -> None:
     )
 
 
+def _assert_pallas_rng_avoids_int64(testcase: TestCase, code: str) -> None:
+    if _get_backend() == "pallas":
+        testcase.assertNotIn("jnp.int64", code)
+
+
 def _assert_bitwise_equal_float(
     testcase: TestCase, actual: torch.Tensor, expected: torch.Tensor
 ) -> None:
@@ -323,6 +328,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             "Same seed should produce identical outputs",
         )
         _assert_uses_philox(self, code3)
+        _assert_pallas_rng_avoids_int64(self, code3)
 
         # Check that all values are in [0, 1) range
         self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")

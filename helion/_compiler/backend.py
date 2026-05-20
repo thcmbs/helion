@@ -1596,9 +1596,9 @@ class PallasBackend(Backend):
         return None
 
     def rng_seed_buffer_expr(self, count: int) -> str:
-        # Generate on CPU, then move to the accelerator so the full 64-bit
-        # Philox seed survives backend handoff.
-        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(torch.accelerator.current_accelerator())"
+        # Pallas TPU runs with JAX x64 disabled, so RNG lowering consumes
+        # 32-bit seeds explicitly rather than relying on JAX to truncate int64.
+        return f"inductor_prims.seeds({count}, torch.device('cpu')).to(dtype=torch.int32, device=torch.accelerator.current_accelerator())"
 
     def _compute_block_spec_info(
         self,
