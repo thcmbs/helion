@@ -1252,6 +1252,14 @@ class CompileEnvironment:
     ) -> JaggedTileScheduleInfo | None:
         return self.jagged_tile_schedule_infos.get(block_id)
 
+    def jagged_tile_schedule(self, block_id: int) -> str | None:
+        info = self.get_jagged_tile_schedule_info(block_id)
+        return None if info is None else info.schedule
+
+    def jagged_tile_group_id(self, block_id: int) -> int | None:
+        info = self.get_jagged_tile_schedule_info(block_id)
+        return None if info is None else info.group_id
+
 
 class NoCurrentEnvironment(RuntimeError):
     pass

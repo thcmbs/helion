@@ -324,6 +324,7 @@ class DeviceFunction:
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
+        from .grouped_m_schedule import GroupedMDimRole
         from .grouped_m_schedule import collect_grouped_m_access_roles
         from .grouped_m_schedule import collect_grouped_m_schedule_plans
 
@@ -340,6 +341,21 @@ class DeviceFunction:
                 self.grouped_m_schedule_plans,
             )
         )
+        self.pallas_grouped_m_tensor_dim_roles: dict[int, tuple[str, ...]] = {
+            id(role.tensor): tuple(
+                dim_role.value
+                if dim_role
+                in (
+                    GroupedMDimRole.PACKED_M,
+                    GroupedMDimRole.GROUP,
+                    GroupedMDimRole.OUTPUT,
+                    GroupedMDimRole.REDUCTION,
+                )
+                else "other"
+                for dim_role in role.dim_roles
+            )
+            for role in self.grouped_m_access_roles
+        }
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}

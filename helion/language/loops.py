@@ -809,6 +809,7 @@ def _(
             raise exc.InvalidJaggedTileUsage(
                 "hl.jagged_tile grouped_m group must be one of the jagged parent tiles"
             )
+        env.block_sizes[group_id].update_max_block(1)
     elif _not_none(offsets) or _not_none(group):
         raise exc.InvalidJaggedTileUsage(
             "hl.jagged_tile offsets= and group= require schedule="

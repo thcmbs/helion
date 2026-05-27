@@ -71,6 +71,14 @@ class TensorIndexPattern(IndexingPattern):
 
 
 @dataclass
+class GroupedJaggedIndexPattern(IndexingPattern):
+    """Contiguous packed-row index produced inside a grouped-M jagged loop."""
+
+    block_id: int
+    index_ndim: int
+
+
+@dataclass
 class IndirectGatherPattern(IndexingPattern):
     """Indirect gather load ``table[idx, ...]`` - no tiling on this dim."""
 
@@ -246,6 +254,24 @@ def _detect_indexing_pattern(
         # A tensor-valued index that didn't match any arithmetic-of-tile
         # pattern is an indirect gather (e.g. table[idx, :]).
         if isinstance(idx_val, torch.Tensor):
+            tile_block_ids: list[int] = []
+            for size in idx_val.shape:
+                block_id = env.get_block_id(size)
+                if (
+                    block_id is not None
+                    and env.is_jagged_tile(block_id)
+                    and env.jagged_tile_schedule(block_id) == "grouped_m"
+                ):
+                    return GroupedJaggedIndexPattern(
+                        block_id=block_id,
+                        index_ndim=idx_val.ndim,
+                    )
+                if block_id is not None:
+                    tile_block_ids.append(block_id)
+                elif size != 1:
+                    tile_block_ids.append(-1)
+            if len(tile_block_ids) == 1 and tile_block_ids[0] >= 0:
+                return TilePattern(block_id=tile_block_ids[0])
             return TensorIndexPattern()
         # Indices produced by other FX nodes, such as indices[tile] used in
         # tensor-indexed atomics, are legal but cannot participate in Pallas
@@ -288,14 +314,57 @@ def _update_tiling_decision(
                 # so fallback to no-tiling so that we can access using both tiles
                 _disallow_tiling()
 
-    if isinstance(pattern, TilePattern):
+    def _record_grouped_m_role(role: str) -> None:
+        from ..device_function import DeviceFunction
+        from ..device_function import NoCurrentFunction
+
+        try:
+            device_fn = DeviceFunction.current()
+        except NoCurrentFunction:
+            return
+        tensor_id = id(tensor)
+        roles = list(
+            device_fn.pallas_grouped_m_tensor_dim_roles.get(
+                tensor_id,
+                ("other",) * tensor.ndim,
+            )
+        )
+        roles[tensor_dim] = role
+        device_fn.pallas_grouped_m_tensor_dim_roles[tensor_id] = tuple(roles)
+
+    def _grouped_m_pipeline_axis_role(block_id: int) -> str | None:
+        from ..device_function import DeviceFunction
+        from ..device_function import NoCurrentFunction
+
+        try:
+            device_fn = DeviceFunction.current()
+        except NoCurrentFunction:
+            return None
+        for plan in device_fn.grouped_m_schedule_plans:
+            if plan.output_block_id == block_id:
+                return "output"
+            if plan.reduction_block_id == block_id:
+                return "reduction"
+        return None
+
+    if isinstance(pattern, (TilePattern, GroupedJaggedIndexPattern)):
         _try_set_tiling_block_id(pattern.block_id)
+        if isinstance(pattern, GroupedJaggedIndexPattern):
+            _record_grouped_m_role("packed_m")
+        elif _is_grouped_m_parent_block(env, pattern.block_id):
+            _record_grouped_m_role("group")
+        elif role := _grouped_m_pipeline_axis_role(pattern.block_id):
+            _record_grouped_m_role(role)
 
     elif isinstance(pattern, TileIndexWithOffsetPattern):
         _disallow_tiling()
 
     elif isinstance(pattern, TileBeginWithOffsetPattern):
         _try_set_tiling_block_id(pattern.block_id)
+        if _is_grouped_m_parent_block(env, pattern.block_id):
+            _record_grouped_m_role("group")
+        elif role := _grouped_m_pipeline_axis_role(pattern.block_id):
+            _record_grouped_m_role(role)
         # check bounds
         if not isinstance(pattern.offset, int) or pattern.offset < 0:
             _disallow_tiling()
@@ -338,6 +407,16 @@ def _update_tiling_decision(
                 _disallow_tiling()
 
 
+def _is_grouped_m_parent_block(env: CompileEnvironment, block_id: int) -> bool:
+    for jagged_block_id, parent_ids in env.jagged_tile_parent_ids.items():
+        if (
+            block_id in parent_ids
+            and env.jagged_tile_schedule(jagged_block_id) == "grouped_m"
+        ):
+            return True
+    return False
+
+
 def resident_block_elements(
     tensor: torch.Tensor,
     patterns: list[IndexingPattern],
@@ -368,7 +447,7 @@ def resident_block_elements(
         if not isinstance(dim_size, int):
             # No support for dynamic shapes.
             return None
-        if isinstance(p, (TilePattern, TileIndexWithOffsetPattern)):
+        if isinstance(p, (TilePattern, TileIndexWithOffsetPattern, GroupedJaggedIndexPattern)):
             bs = env.block_sizes[p.block_id].from_config(config)
             if isinstance(bs, int):
                 dim_size = min(bs, dim_size)

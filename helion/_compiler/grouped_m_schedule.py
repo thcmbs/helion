@@ -21,6 +21,8 @@ class GroupedMSchedulePlan:
     group_block_id: int
     offsets: torch.Tensor
     loop_graph_ids: tuple[int, ...]
+    output_block_id: int | None = None
+    reduction_block_id: int | None = None
 
     def owns_block_id(self, block_id: int) -> bool:
         return block_id == self.jagged_block_id or block_id in self.parent_block_ids
@@ -29,6 +31,8 @@ class GroupedMSchedulePlan:
 class GroupedMDimRole(enum.Enum):
     PACKED_M = "packed_m"
     GROUP = "group"
+    OUTPUT = "output"
+    REDUCTION = "reduction"
     TILE = "tile"
     FULL_SLICE = "full_slice"
     SCALAR = "scalar"
@@ -80,6 +84,12 @@ def collect_grouped_m_schedule_plans(
             for graph in graphs
             if related_blocks.intersection(getattr(graph, "block_ids", ()))
         )
+        output_block_id, reduction_block_id = _infer_grouped_m_pipeline_axes(
+            env,
+            graphs,
+            jagged_block_id=jagged_block_id,
+            group_block_id=info.group_id,
+        )
         plans.append(
             GroupedMSchedulePlan(
                 jagged_block_id=jagged_block_id,
@@ -87,9 +97,62 @@ def collect_grouped_m_schedule_plans(
                 group_block_id=info.group_id,
                 offsets=info.offsets,
                 loop_graph_ids=loop_graph_ids,
+                output_block_id=output_block_id,
+                reduction_block_id=reduction_block_id,
             )
         )
     return tuple(plans)
+
+
+def _infer_grouped_m_pipeline_axes(
+    env: CompileEnvironment,
+    graphs: Sequence[GraphInfo],
+    *,
+    jagged_block_id: int,
+    group_block_id: int,
+) -> tuple[int | None, int | None]:
+    """Infer output-N and reduction-K axes for the first grouped-M pipeline.
+
+    This is role-based, not kernel-name based:
+    - output axis appears with the packed-M axis on a store;
+    - reduction axis appears on packed-M/group loads but not on packed-M stores.
+    """
+    from ..language import memory_ops
+
+    store_tile_blocks: set[int] = set()
+    load_tile_blocks: set[int] = set()
+    for graph in graphs:
+        for node in graph.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
+                continue
+            subscript = node.args[1]
+            if not isinstance(subscript, (list, tuple)):
+                continue
+            block_ids = [_block_ids_in_index(env, idx) for idx in subscript]
+            flat_ids = {bid for ids in block_ids for bid in ids}
+            if jagged_block_id not in flat_ids:
+                continue
+            tile_ids = {
+                bid
+                for bid in flat_ids
+                if bid not in (jagged_block_id, group_block_id)
+            }
+            if node.target is memory_ops.store:
+                store_tile_blocks.update(tile_ids)
+            else:
+                load_tile_blocks.update(tile_ids)
+    output_block_id = next(iter(sorted(store_tile_blocks)), None)
+    reduction_candidates = sorted(load_tile_blocks - store_tile_blocks)
+    reduction_block_id = next(iter(reduction_candidates), None)
+    return output_block_id, reduction_block_id
+
+
+def _block_ids_in_index(env: CompileEnvironment, idx: object) -> frozenset[int]:
+    value = idx.meta.get("val") if isinstance(idx, torch.fx.Node) else idx
+    return _block_ids_in_value(env, value)
 
 
 def collect_grouped_m_access_roles(
@@ -159,6 +222,10 @@ def _classify_subscript_roles(
             roles.append(GroupedMDimRole.PACKED_M)
         elif plan.group_block_id in block_ids:
             roles.append(GroupedMDimRole.GROUP)
+        elif plan.output_block_id in block_ids:
+            roles.append(GroupedMDimRole.OUTPUT)
+        elif plan.reduction_block_id in block_ids:
+            roles.append(GroupedMDimRole.REDUCTION)
         elif block_ids:
             roles.append(GroupedMDimRole.TILE)
         elif isinstance(value, (int, torch.SymInt)):
