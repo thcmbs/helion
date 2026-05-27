@@ -9,6 +9,8 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion._compiler.grouped_m_schedule import GroupedMDimRole
+from helion._compiler.grouped_m_schedule import collect_grouped_m_access_roles
 from helion._compiler.grouped_m_schedule import collect_grouped_m_schedule_plans
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -2703,6 +2705,63 @@ class TestPallas(TestCase):
             'schedule="grouped_m" requires group=',
         ):
             missing_group.bind((x, offsets))
+
+    def test_grouped_m_2d_bmm_access_roles(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+        def jagged_dense_bmm_2d_hinted(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            dense: torch.Tensor,
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B, _D, K = dense.shape
+            out = torch.empty([L, K], dtype=jagged.dtype, device=jagged.device)
+            for tile_b in hl.tile(B):
+                starts = seq_offsets[tile_b]
+                ends = seq_offsets[tile_b.index + 1]
+                seq_len = ends - starts
+
+                for tile_m in hl.jagged_tile(
+                    seq_len,
+                    schedule="grouped_m",
+                    offsets=seq_offsets,
+                    group=tile_b,
+                ):
+                    m = starts[:, None] + tile_m.index[None, :]
+                    for tile_k in hl.tile(0, K):
+                        acc = hl.zeros(
+                            [tile_b, tile_m, tile_k],
+                            dtype=jagged.dtype,
+                            device=jagged.device,
+                        )
+                        for tile_d in hl.tile(0, D):
+                            acc = acc + torch.matmul(
+                                jagged[m, tile_d],
+                                dense[tile_b, tile_d, tile_k],
+                            )
+                        out[m, tile_k] = acc
+            return out
+
+        offsets = torch.tensor([0, 4, 8], dtype=torch.int32)
+        jagged = torch.randn(8, 16)
+        dense = torch.randn(2, 16, 32)
+        bound = jagged_dense_bmm_2d_hinted.bind((offsets, jagged, dense))
+        plans = collect_grouped_m_schedule_plans(
+            bound.env,
+            bound.host_function.device_ir.graphs,
+        )
+        with bound.env, bound.host_function:
+            roles = collect_grouped_m_access_roles(
+                bound.env,
+                bound.host_function.device_ir.graphs,
+                plans,
+            )
+        role_shapes = {tuple(role.dim_roles) for role in roles}
+        self.assertIn(
+            (GroupedMDimRole.PACKED_M, GroupedMDimRole.TILE),
+            role_shapes,
+        )
+        self.assertTrue(any(role.kind == "store" for role in roles))
 
     def test_nested_fori_loop_scratch_scoping(self) -> None:
         """Nested hl.tile(start, end) with inner accumulator"""

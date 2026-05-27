@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .grouped_m_schedule import GroupedMSchedulePlan
+    from .grouped_m_schedule import GroupedMTensorAccessRole
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from helion._compiler.pallas.plan_tiling import DimensionTiling
@@ -323,12 +324,20 @@ class DeviceFunction:
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
+        from .grouped_m_schedule import collect_grouped_m_access_roles
         from .grouped_m_schedule import collect_grouped_m_schedule_plans
 
         self.grouped_m_schedule_plans: tuple[GroupedMSchedulePlan, ...] = (
             collect_grouped_m_schedule_plans(
                 CompileEnvironment.current(),
                 codegen.codegen_graphs,
+            )
+        )
+        self.grouped_m_access_roles: tuple[GroupedMTensorAccessRole, ...] = (
+            collect_grouped_m_access_roles(
+                CompileEnvironment.current(),
+                codegen.codegen_graphs,
+                self.grouped_m_schedule_plans,
             )
         )
 
