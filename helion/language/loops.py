@@ -582,6 +582,10 @@ def _(
 )
 def jagged_tile(
     parent: object,
+    *,
+    schedule: str | None = None,
+    offsets: object | None = None,
+    group: object | None = None,
 ) -> Iterator[Tile]:
     """
     Iterate over a jagged inner dimension using an N-D parent tensor of per-lane ends.
@@ -615,6 +619,13 @@ def jagged_tile(
         parent: N-D tensor whose every axis is an enclosing tile axis. ``parent[i, ...]``
                 is the true end of the jagged child loop for that combination of parent
                 lanes. The 1-D case is the common scalar-of-rows pattern.
+        schedule: Optional backend schedule hint. ``"grouped_m"`` records that this
+                  jagged loop may be lowered as a grouped-M schedule by backends that
+                  support it. Backends may ignore the hint and use regular jagged
+                  lowering.
+        offsets: Packed-row offsets for ``schedule="grouped_m"``. The first version of
+                 grouped-M lowering expects an int32 tensor with shape ``[groups + 1]``.
+        group: Parent group tile for ``schedule="grouped_m"``.
 
     Returns:
         Iterator[Tile]: Iterator over tile objects for the jagged child dimension
@@ -713,6 +724,9 @@ def jagged_tile(
 @_decorators.type_propagation(jagged_tile)
 def _(
     parent: TypeInfo,
+    schedule: TypeInfo | None = None,
+    offsets: TypeInfo | None = None,
+    group: TypeInfo | None = None,
     *,
     origin: Origin,
 ) -> TypeInfo:
@@ -742,9 +756,73 @@ def _(
     if isinstance(proxy_parent, Tile):
         raise exc.TileOfTile
 
+    schedule_value: str | None = None
+    offsets_value: torch.Tensor | None = None
+    group_id: int | None = None
+    if _not_none(schedule):
+        try:
+            schedule_literal = schedule.as_literal()
+        except NotImplementedError:
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile schedule must be a string literal"
+            ) from None
+        if not isinstance(schedule_literal, str):
+            raise exc.InvalidJaggedTileUsage(
+                f"hl.jagged_tile schedule must be a string literal, got {type(schedule_literal)}"
+            )
+        if schedule_literal != "grouped_m":
+            raise exc.InvalidJaggedTileUsage(
+                f"unsupported hl.jagged_tile schedule {schedule_literal!r}"
+            )
+        schedule_value = schedule_literal
+
+        if not _not_none(offsets):
+            raise exc.InvalidJaggedTileUsage(
+                'hl.jagged_tile schedule="grouped_m" requires offsets='
+            )
+        offsets_proxy = _to_proxy(offsets)
+        if not isinstance(offsets_proxy, torch.Tensor):
+            raise exc.InvalidJaggedTileUsage(
+                f"hl.jagged_tile offsets must be a tensor, got {type(offsets_proxy)}"
+            )
+        if offsets_proxy.ndim != 1:
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile grouped_m offsets must be a rank-1 tensor"
+            )
+        if offsets_proxy.dtype != torch.int32:
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile grouped_m offsets must have dtype torch.int32"
+            )
+        offsets_value = offsets_proxy
+
+        if not _not_none(group):
+            raise exc.InvalidJaggedTileUsage(
+                'hl.jagged_tile schedule="grouped_m" requires group='
+            )
+        group_proxy = _to_proxy(group)
+        if not isinstance(group_proxy, Tile):
+            raise exc.InvalidJaggedTileUsage(
+                f"hl.jagged_tile grouped_m group must be a Tile, got {type(group_proxy)}"
+            )
+        group_id = group_proxy.block_id
+        if group_id not in parent_block_ids:
+            raise exc.InvalidJaggedTileUsage(
+                "hl.jagged_tile grouped_m group must be one of the jagged parent tiles"
+            )
+    elif _not_none(offsets) or _not_none(group):
+        raise exc.InvalidJaggedTileUsage(
+            "hl.jagged_tile offsets= and group= require schedule="
+        )
+
     base = TileIndexType.allocate(None, origin)
     result = JaggedTileIndexType(origin, base.block_id, parent_block_ids)
-    env.register_jagged_tile(base.block_id, parent_block_ids)
+    env.register_jagged_tile(
+        base.block_id,
+        parent_block_ids,
+        schedule=schedule_value,
+        group_id=group_id,
+        offsets=offsets_value,
+    )
 
     _add_config_choices(
         [result.block_id],

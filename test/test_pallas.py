@@ -2619,6 +2619,81 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, ref, rtol=1e-3, atol=1e-3)
 
+    def test_jagged_tile_grouped_m_hints_are_recorded(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+        def jagged_row_sum_hinted(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                ends = x_offsets[tile_b.index + 1]
+                nnz = ends - starts
+                acc = hl.zeros([tile_b], dtype=x_data.dtype)
+
+                for tile_k in hl.jagged_tile(
+                    nnz,
+                    schedule="grouped_m",
+                    offsets=x_offsets,
+                    group=tile_b,
+                ):
+                    idx = starts[:, None] + tile_k.index[None, :]
+                    acc = acc + x_data[idx].sum(dim=1)
+
+                out[tile_b] = acc
+            return out
+
+        offsets = torch.tensor([0, 3, 4, 8, 10], dtype=torch.int32)
+        x = torch.randn(int(offsets[-1].item()), dtype=torch.float32)
+
+        bound = jagged_row_sum_hinted.bind((x, offsets))
+        infos = [
+            info
+            for info in bound.env.jagged_tile_schedule_infos.values()
+            if info.schedule == "grouped_m"
+        ]
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].offsets.dtype, torch.int32)
+        self.assertIn(infos[0].group_id, infos[0].parent_ids)
+        self.assertEqual(
+            bound.env.jagged_tile_parent_ids,
+            {
+                block_id: list(info.parent_ids)
+                for block_id, info in bound.env.jagged_tile_schedule_infos.items()
+            },
+        )
+
+    def test_jagged_tile_grouped_m_hint_validation(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
+        def missing_group(
+            x_data: torch.Tensor, x_offsets: torch.Tensor
+        ) -> torch.Tensor:
+            b = x_offsets.size(0) - 1
+            out = torch.zeros([b], dtype=x_data.dtype, device=x_data.device)
+            for tile_b in hl.tile(b):
+                starts = x_offsets[tile_b]
+                nnz = x_offsets[tile_b.index + 1] - starts
+                for tile_k in hl.jagged_tile(
+                    nnz,
+                    schedule="grouped_m",
+                    offsets=x_offsets,
+                ):
+                    out[tile_b] = x_data[starts[:, None] + tile_k.index[None, :]].sum(
+                        dim=1
+                    )
+            return out
+
+        offsets = torch.tensor([0, 2, 5], dtype=torch.int32)
+        x = torch.randn(int(offsets[-1].item()), dtype=torch.float32)
+
+        with self.assertRaisesRegex(
+            helion.exc.InvalidJaggedTileUsage,
+            'schedule="grouped_m" requires group=',
+        ):
+            missing_group.bind((x, offsets))
+
     def test_nested_fori_loop_scratch_scoping(self) -> None:
         """Nested hl.tile(start, end) with inner accumulator"""
 
