@@ -1119,6 +1119,16 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     lhs_ndim = lhs_node_arg.meta["val"].ndim
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
+    if _should_squeeze_grouped_m_pallas_bmm(ctx, lhs_node_arg, rhs_node_arg):
+        lhs = expr_from_string(
+            "jnp.reshape({lhs}, (-1, {lhs}.shape[-1]))",
+            lhs=lhs,
+        )
+        rhs = expr_from_string(
+            "jnp.reshape({rhs}, ({rhs}.shape[-2], {rhs}.shape[-1]))",
+            rhs=rhs,
+        )
+        lhs_ndim = 2
 
     return _emit_pallas_matmul(
         lhs,
@@ -1127,6 +1137,33 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
         lhs_ndim=lhs_ndim,
+    )
+
+
+def _should_squeeze_grouped_m_pallas_bmm(
+    ctx: LoweringContext,
+    lhs_node: Node,
+    rhs_node: Node,
+) -> bool:
+    """Use a 2D dot for grouped-M BMMs whose batch axis is the size-1 group tile."""
+    config = ctx.cg.device_function.config
+    if config.get("pallas_loop_type") != "grouped_m_pipeline":
+        return False
+    lhs_val = lhs_node.meta.get("val")
+    rhs_val = rhs_node.meta.get("val")
+    if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+        return False
+    if lhs_val.ndim != 3 or rhs_val.ndim != 3:
+        return False
+    env = CompileEnvironment.current()
+    lhs_block = env.get_block_id(lhs_val.shape[0])
+    rhs_block = env.get_block_id(rhs_val.shape[0])
+    if lhs_block is None or rhs_block is None or lhs_block != rhs_block:
+        return False
+    return any(
+        plan.group_block_id == lhs_block
+        and env.block_sizes[lhs_block].from_config(config) == 1
+        for plan in ctx.cg.device_function.grouped_m_schedule_plans
     )
 
 

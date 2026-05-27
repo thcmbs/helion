@@ -330,10 +330,79 @@ def _(state: CodegenState) -> None:
     value = pallas_codegen.sliced_value_for_store(
         state, tensor, subscript, parts, value
     )
+    value = CompileEnvironment.current().backend.cast_ast(value, tensor.dtype)
     idx_str = ", ".join(parts)
-    state.codegen.add_statement(
-        statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
-    )
+    store_stmt = statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
+    if _pallas_grouped_m_store_on_last_reduction(state, tensor):
+        fn_name = state.device_function.new_var("_store_grouped_m_output", dce=True)
+        store_value = state.device_function.new_var("_grouped_m_store_value", dce=True)
+        gm_id = state.device_function.new_var("_grouped_m_gm_id", dce=True)
+        m_start = state.device_function.new_var("_grouped_m_m_start", dce=True)
+        m_end = state.device_function.new_var("_grouped_m_m_end", dce=True)
+        m_offset = state.device_function.new_var("_grouped_m_m_offset", dce=True)
+        m_start_local = state.device_function.new_var(
+            "_grouped_m_m_start_local", dce=True
+        )
+        m_end_local = state.device_function.new_var(
+            "_grouped_m_m_end_local", dce=True
+        )
+        iota = state.device_function.new_var("_grouped_m_iota", dce=True)
+        mask = state.device_function.new_var("_grouped_m_mask", dce=True)
+        zeros = state.device_function.new_var("_grouped_m_partial_zeros", dce=True)
+        sublane = state.device_function.new_var("_grouped_m_sublane", dce=True)
+        last_row = state.device_function.new_var("_grouped_m_last_row", dce=True)
+        last_partial = state.device_function.new_var(
+            "_grouped_m_last_partial", dce=True
+        )
+        partial_tile = state.device_function.new_var("_grouped_m_partial_tile", dce=True)
+        row_block_iota = state.device_function.new_var(
+            "_grouped_m_row_block_iota", dce=True
+        )
+        prev_partial = state.device_function.new_var(
+            "_grouped_m_prev_partial", dce=True
+        )
+        state.codegen.add_statement(
+            statement_from_string(
+                f"@pl.when(pl.program_id(2) == pl.num_programs(2) - 1)\n"
+                f"def {fn_name}():\n"
+                f"    {store_value} = {{value}}\n"
+                f"    {gm_id} = pl.program_id(1)\n"
+                f"    {m_start} = _helion_m_offsets[{gm_id}]\n"
+                f"    {m_end} = _helion_m_offsets[{gm_id} + 1]\n"
+                f"    {sublane} = _helion_partial_out_ref.shape[0]\n"
+                f"    {m_offset} = {m_start} - {m_start} % {sublane}\n"
+                f"    {m_start_local} = {m_start} - {m_offset}\n"
+                f"    {m_end_local} = {m_end} - {m_offset}\n"
+                f"    {iota} = lax.broadcasted_iota(jnp.int32, {store_value}.shape, 0)\n"
+                f"    {mask} = jnp.logical_and({m_start_local} <= {iota}, {iota} < {m_end_local})\n"
+                f"    {zeros} = jnp.zeros_like(_helion_partial_out_ref[...])\n"
+                f"    {store_value} = jnp.where({mask}, {store_value}, 0)\n"
+                f"    {prev_partial} = jnp.where({gm_id} == 0, {zeros}, _helion_partial_out_ref[...])\n"
+                f"    {prev_partial} = jnp.broadcast_to({prev_partial}[None, :, :], ({store_value}.shape[0] // {sublane}, {sublane}, {store_value}.shape[1])).reshape({store_value}.shape)\n"
+                f"    {store_value} = {store_value} + jnp.where({iota} < {sublane}, {prev_partial}, 0)\n"
+                f"    {last_row} = {m_end_local} // {sublane}\n"
+                f"    {partial_tile} = {store_value}.reshape(({store_value}.shape[0] // {sublane}, {sublane}, {store_value}.shape[1]))\n"
+                f"    {row_block_iota} = lax.broadcasted_iota(jnp.int32, {partial_tile}.shape, 0)\n"
+                f"    {last_partial} = jnp.sum(jnp.where({row_block_iota} == {last_row}, {partial_tile}, 0), axis=0)\n"
+                f"    _helion_partial_out_ref[...] = jnp.where({m_end_local} % {sublane} == 0, {zeros}, {last_partial})\n"
+                f"    {name}[{idx_str}] = {store_value}",
+                value=value,
+            )
+        )
+    else:
+        state.codegen.add_statement(store_stmt)
+
+
+def _pallas_grouped_m_store_on_last_reduction(
+    state: CodegenState,
+    tensor: torch.Tensor,
+) -> bool:
+    if state.config.get("pallas_loop_type") != "grouped_m_pipeline":
+        return False
+    roles = state.device_function.pallas_grouped_m_tensor_dim_roles.get(id(tensor))
+    if roles is None or "packed_m" not in roles or "output" not in roles:
+        return False
+    return any(plan.reduction_block_id is not None for plan in state.device_function.grouped_m_schedule_plans)
 
 
 def _matching_block_ids(env: CompileEnvironment, size: object) -> list[int]:
