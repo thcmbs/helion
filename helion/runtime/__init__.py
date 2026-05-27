@@ -1038,6 +1038,76 @@ def default_pallas_launcher(
     )
 
 
+def _pallas_pipeline_scratch_shapes(
+    jnp: object,
+    pltpu: object,
+    scratch_shape_specs: list[tuple[tuple[int, ...], str | None, str]]
+    | list[tuple[tuple[int, ...], str]],
+) -> list[object]:
+    _jnp_dtype_map = _pallas_jnp_dtype_map()
+    scratch_shapes = []
+    for scratch_entry in scratch_shape_specs:
+        if len(scratch_entry) == 3:
+            shape, dtype_str, scratch_type = scratch_entry
+        else:
+            shape, dtype_str = scratch_entry  # type: ignore[misc]
+            scratch_type = "vmem"
+        if scratch_type == "dma_semaphore":
+            scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
+        else:
+            jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
+            scratch_shapes.append(
+                pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
+            )
+    return scratch_shapes
+
+
+class _DefaultPallasEmitPipelineAdapter:
+    def build_grid_spec(
+        self,
+        pl: object,
+        jnp: object,
+        pltpu: object,
+        *,
+        grid: tuple[int, ...],
+        args: tuple[object, ...],
+        tensor_arg_indices: list[int],
+        output_indices: list[int],
+        block_spec_info: _BlockSpecInfo,
+        pipeline_arg_indices: list[int] | None,
+        output_only_indices: list[int],
+        smem_arg_indices: list[int] | None,
+        scratch_shape_specs: list[tuple[tuple[int, ...], str | None, str]]
+        | list[tuple[tuple[int, ...], str]],
+    ) -> tuple[object, object, list[object], object]:
+        scratch_shapes = _pallas_pipeline_scratch_shapes(
+            jnp,
+            pltpu,
+            scratch_shape_specs,
+        )
+        in_specs, out_specs = _pallas_build_pipeline_specs(
+            pl,
+            jnp,
+            pltpu,
+            grid,
+            args,
+            tensor_arg_indices,
+            output_indices,
+            block_spec_info,
+            pipeline_arg_indices,
+            output_only_indices,
+            smem_arg_indices=smem_arg_indices,
+        )
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=scratch_shapes,
+            grid=grid,
+        )
+        return in_specs, out_specs, scratch_shapes, grid_spec
+
+
 def default_pallas_pipeline_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1100,38 +1170,24 @@ def default_pallas_pipeline_launcher(
             args, _output_indices, _inplace_indices, interpret=interpret
         )
 
-        # Build scratch shapes for VMEM
-        _jnp_dtype_map = _pallas_jnp_dtype_map()
-        scratch_shapes = []
-        for scratch_entry in _scratch_shapes:
-            if len(scratch_entry) == 3:
-                shape, dtype_str, scratch_type = scratch_entry
-            else:
-                shape, dtype_str = scratch_entry  # type: ignore[misc]
-                scratch_type = "vmem"
-            if scratch_type == "dma_semaphore":
-                scratch_shapes.append(pltpu.SemaphoreType.DMA(()))
-            else:
-                jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)
-                scratch_shapes.append(
-                    pltpu.VMEM(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
-                )
-
         assert _block_spec_info is not None, (
             "emit_pipeline launcher requires _block_spec_info from codegen"
         )
-        in_specs_list, out_specs = _pallas_build_pipeline_specs(
-            pl,
-            jnp,
-            pltpu,
-            grid,
-            args,
-            tensor_arg_indices,
-            _output_indices,
-            _block_spec_info,
-            _pipeline_arg_indices,
-            output_only_indices,
-            smem_arg_indices=_smem_arg_indices,
+        in_specs_list, out_specs, scratch_shapes, grid_spec = (
+            _DefaultPallasEmitPipelineAdapter().build_grid_spec(
+                pl,
+                jnp,
+                pltpu,
+                grid=grid,
+                args=args,
+                tensor_arg_indices=tensor_arg_indices,
+                output_indices=_output_indices,
+                block_spec_info=_block_spec_info,
+                pipeline_arg_indices=_pipeline_arg_indices,
+                output_only_indices=output_only_indices,
+                smem_arg_indices=_smem_arg_indices,
+                scratch_shape_specs=_scratch_shapes,
+            )
         )
 
         _pipeline_set = set(_pipeline_arg_indices or [])
@@ -1150,14 +1206,6 @@ def default_pallas_pipeline_launcher(
         )
 
         out_shape_arg = out_shapes if len(out_shapes) > 1 else out_shapes[0]
-
-        grid_spec = pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
-            in_specs=in_specs_list,
-            out_specs=out_specs,
-            scratch_shapes=scratch_shapes,
-            grid=grid,
-        )
 
         estimated_vmem = _estimate_pallas_vmem_bytes(
             pl,
