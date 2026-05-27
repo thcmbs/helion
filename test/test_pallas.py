@@ -9,6 +9,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion._compiler.grouped_m_schedule import collect_grouped_m_schedule_plans
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -2664,6 +2665,15 @@ class TestPallas(TestCase):
                 for block_id, info in bound.env.jagged_tile_schedule_infos.items()
             },
         )
+        plans = collect_grouped_m_schedule_plans(
+            bound.env,
+            bound.host_function.device_ir.graphs,
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].jagged_block_id, next(iter(bound.env.jagged_tile_schedule_infos)))
+        self.assertEqual(plans[0].group_block_id, infos[0].group_id)
+        self.assertEqual(plans[0].offsets.dtype, torch.int32)
+        self.assertTrue(plans[0].loop_graph_ids)
 
     def test_jagged_tile_grouped_m_hint_validation(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")

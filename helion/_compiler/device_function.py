@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
+    from .grouped_m_schedule import GroupedMSchedulePlan
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from helion._compiler.pallas.plan_tiling import DimensionTiling
@@ -321,6 +322,15 @@ class DeviceFunction:
         self.epilogue_subtile_store_indices: dict[str, int] = {}
         self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+
+        from .grouped_m_schedule import collect_grouped_m_schedule_plans
+
+        self.grouped_m_schedule_plans: tuple[GroupedMSchedulePlan, ...] = (
+            collect_grouped_m_schedule_plans(
+                CompileEnvironment.current(),
+                codegen.codegen_graphs,
+            )
+        )
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
