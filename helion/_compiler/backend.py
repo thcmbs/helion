@@ -1157,6 +1157,7 @@ class PallasBackend(Backend):
             "_default_pallas_launcher": "from helion.runtime import default_pallas_launcher as _default_pallas_launcher",
             "_default_pallas_pipeline_launcher": "from helion.runtime import default_pallas_pipeline_launcher as _default_pallas_pipeline_launcher",
             "_default_pallas_fori_launcher": "from helion.runtime import default_pallas_fori_launcher as _default_pallas_fori_launcher",
+            "_default_pallas_grouped_m_pipeline_builder": "from helion.runtime import default_pallas_grouped_m_pipeline_builder as _default_pallas_grouped_m_pipeline_builder",
         }
 
     # Config keys that Pallas actually uses.  Everything else
@@ -1440,6 +1441,7 @@ class PallasBackend(Backend):
         from ..autotuner.config_spec import BlockSizeSpec
         from .ast_extension import ExtendedAST
         from .compile_environment import BlockSizeInfo
+        from .compile_environment import CompileEnvironment
         from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
         from helion._compiler.type_propagation import SequenceType
@@ -1563,6 +1565,14 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
+            schedule = CompileEnvironment.current().jagged_tile_schedule(bid)
+            grouped_parent_ids = {
+                info.group_id
+                for info in CompileEnvironment.current().jagged_tile_schedule_infos.values()
+                if info.schedule == "grouped_m" and info.group_id is not None
+            }
+            if bid in grouped_parent_ids or schedule == "grouped_m":
+                continue
             if bid not in analyzer.required_alignments:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
@@ -1890,7 +1900,7 @@ class PallasBackend(Backend):
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         pallas_loop_type = config.get("pallas_loop_type", "unroll")
-        if pallas_loop_type in ("emit_pipeline", "fori_loop"):
+        if pallas_loop_type in ("emit_pipeline", "fori_loop", "grouped_m_pipeline"):
             scratch_shapes = [
                 (
                     s.shape,
@@ -1918,6 +1928,94 @@ class PallasBackend(Backend):
                         f"_pipeline_arg_indices={pipeline_arg_indices!r}"
                     )
 
+        if pallas_loop_type == "grouped_m_pipeline":
+            grouped_plans = device_fn.grouped_m_schedule_plans
+            if len(grouped_plans) != 1:
+                raise ValueError(
+                    "Pallas grouped_m_pipeline requires exactly one grouped-M schedule"
+                )
+            if sorted_args is None:
+                raise ValueError(
+                    "Pallas grouped_m_pipeline requires sorted launcher args"
+                )
+            from .device_function import TensorArg
+
+            plan = grouped_plans[0]
+            offsets_arg = None
+            tensor_roles = {}
+            for idx, arg in enumerate(sorted_args):
+                if not isinstance(arg, TensorArg):
+                    continue
+                arg_source = env.input_sources.get(arg.fake_value)
+                offsets_source = env.input_sources.get(plan.offsets)
+                if (
+                    arg.fake_value is plan.offsets
+                    or (
+                        arg_source is not None
+                        and offsets_source is not None
+                        and arg_source == offsets_source
+                    )
+                    or (
+                        arg.fake_value.dtype == plan.offsets.dtype
+                        and arg.fake_value.ndim == plan.offsets.ndim
+                        and tuple(arg.fake_value.shape) == tuple(plan.offsets.shape)
+                    )
+                ):
+                    offsets_arg = idx
+                roles = device_fn.pallas_grouped_m_tensor_dim_roles.get(
+                    id(arg.fake_value)
+                )
+                if roles is not None:
+                    tensor_roles[arg.name] = roles
+            if offsets_arg is None:
+                offset_candidates = [
+                    idx
+                    for idx, arg in enumerate(sorted_args)
+                    if isinstance(arg, TensorArg)
+                    and arg.fake_value.ndim == 1
+                    and arg.fake_value.dtype == torch.int32
+                ]
+                if len(offset_candidates) == 1:
+                    offsets_arg = offset_candidates[0]
+            if offsets_arg is None:
+                offsets_source = env.input_sources.get(plan.offsets)
+                offsets_name = getattr(offsets_source, "local_name", None)
+                if not isinstance(offsets_name, str):
+                    raise ValueError(
+                        "Pallas grouped_m_pipeline could not find offsets arg"
+                    )
+                insert_at = next(
+                    (
+                        i
+                        for i, item in enumerate(launcher_args)
+                        if isinstance(item, str) and "=" in item
+                    ),
+                    len(launcher_args),
+                )
+                offsets_arg = insert_at
+                launcher_args.insert(insert_at, offsets_name)
+            grouped_m_plan = {
+                "jagged_block_id": plan.jagged_block_id,
+                "group_block_id": plan.group_block_id,
+                "output_block_id": plan.output_block_id,
+                "reduction_block_id": plan.reduction_block_id,
+                "tile_m": env.block_sizes[plan.jagged_block_id].from_config(config),
+                "tile_n": env.block_sizes[plan.output_block_id].from_config(config)
+                if plan.output_block_id is not None
+                else None,
+                "tile_k": env.block_sizes[plan.reduction_block_id].from_config(config)
+                if plan.reduction_block_id is not None
+                else None,
+                "offsets_arg": offsets_arg,
+                "tensor_roles": tensor_roles,
+            }
+            launcher_args.extend(
+                [
+                    "_grouped_m_plan=" + repr(grouped_m_plan),
+                    "_grouped_m_pipeline_builder=_default_pallas_grouped_m_pipeline_builder",
+                ]
+            )
+
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
@@ -1933,7 +2031,7 @@ class PallasBackend(Backend):
                 f"Invalid pallas_loop_type {pallas_loop_type!r}. "
                 f"Expected one of {VALID_PALLAS_LOOP_TYPES}."
             )
-        if pallas_loop_type == "emit_pipeline":
+        if pallas_loop_type in ("emit_pipeline", "grouped_m_pipeline"):
             return "_default_pallas_pipeline_launcher"
         if pallas_loop_type == "fori_loop":
             return "_default_pallas_fori_launcher"
@@ -1956,9 +2054,43 @@ class PallasBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        if config.get("pallas_loop_type") == "grouped_m_pipeline":
+            from .compile_environment import CompileEnvironment
+            from .device_function import DeviceFunction
+
+            device_fn = DeviceFunction.current()
+            block_sizes = config.config.get("block_sizes")
+            if isinstance(block_sizes, list):
+                for plan in device_fn.grouped_m_schedule_plans:
+                    group_idx = (
+                        CompileEnvironment.current()
+                        .config_spec.block_sizes.block_id_to_index(
+                            plan.group_block_id
+                        )
+                    )
+                    if group_idx < len(block_sizes):
+                        block_sizes[group_idx] = 1
+
         from .pallas.plan_tiling import plan_tiling
 
         plan_tiling(graphs, config, tile_strategy)
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        if (
+            config.get("pallas_loop_type") == "grouped_m_pipeline"
+            and device_fn.grouped_m_schedule_plans
+        ):
+            for name in (
+                "_helion_group_offsets",
+                "_helion_group_ids",
+                "_helion_m_tile_ids",
+                "_helion_m_offsets",
+                "_helion_reduction_acc_ref",
+                "_helion_partial_out_ref",
+            ):
+                if name not in device_fn.wrapper_only_params:
+                    device_fn.wrapper_only_params.append(name)
 
 
 def _detect_mma_loop(

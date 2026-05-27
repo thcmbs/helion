@@ -1108,6 +1108,474 @@ class _DefaultPallasEmitPipelineAdapter:
         return in_specs, out_specs, scratch_shapes, grid_spec
 
 
+def default_pallas_grouped_m_pipeline_builder(**kwargs: object) -> object | None:
+    """Build a grouped-M emit_pipeline callable.
+
+    This adapter owns the runtime part of the grouped-M schedule:
+
+    - build per-GM metadata from an ``offsets: int32[G + 1]`` tensor on device;
+    - route packed-M refs through metadata-backed ``BlockSpec`` objects;
+    - call the compiler-generated Pallas body with the metadata refs.
+
+    The supported first slice is intentionally narrow: 2D packed-M tensors and
+    group-indexed tensors whose group dimension is dim 0. Unsupported cases
+    return ``None`` so the regular launcher can report the normal failure mode.
+    """
+    import dataclasses
+    import functools
+
+    import jax
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    import jax.numpy as jnp
+
+    pallas_kernel = kwargs.get("pallas_kernel")
+    args = kwargs.get("args")
+    tensor_arg_indices = kwargs.get("tensor_arg_indices")
+    arg_to_tensor_pos = kwargs.get("arg_to_tensor_pos")
+    output_indices = kwargs.get("output_indices")
+    out_shapes = kwargs.get("out_shapes")
+    grouped_m_plan = kwargs.get("grouped_m_plan")
+    scratch_shape_specs = kwargs.get("scratch_shape_specs")
+    if not callable(pallas_kernel):
+        return None
+    if not isinstance(args, tuple):
+        return None
+    if not isinstance(tensor_arg_indices, list):
+        return None
+    if not isinstance(arg_to_tensor_pos, dict):
+        return None
+    if not isinstance(output_indices, list) or len(output_indices) != 1:
+        return None
+    if not isinstance(grouped_m_plan, dict):
+        return None
+    if scratch_shape_specs is None:
+        scratch_shape_specs = []
+    if not isinstance(scratch_shape_specs, list):
+        return None
+
+    offsets_arg = grouped_m_plan.get("offsets_arg")
+    jagged_block_id = grouped_m_plan.get("jagged_block_id")
+    output_block_id = grouped_m_plan.get("output_block_id")
+    reduction_block_id = grouped_m_plan.get("reduction_block_id")
+    tensor_roles_obj = grouped_m_plan.get("tensor_roles")
+    if not isinstance(offsets_arg, int) or not isinstance(jagged_block_id, int):
+        return None
+    if not isinstance(output_block_id, int) or not isinstance(reduction_block_id, int):
+        return None
+    if not isinstance(tensor_roles_obj, dict):
+        return None
+    if offsets_arg >= len(args):
+        return None
+    offsets = args[offsets_arg]
+    if not isinstance(offsets, torch.Tensor) or offsets.dtype is not torch.int32:
+        return None
+    if offsets.ndim != 1:
+        return None
+
+    out_arg = output_indices[0]
+    if out_arg >= len(args):
+        return None
+    out = args[out_arg]
+    if not isinstance(out, torch.Tensor) or out.ndim != 2:
+        return None
+
+    try:
+        kernel_param_names = tuple(inspect.signature(pallas_kernel).parameters)
+    except (TypeError, ValueError):
+        return None
+    if len(kernel_param_names) < len(args):
+        return None
+
+    def _role_value(value: object) -> str:
+        return getattr(value, "value", str(value))
+
+    arg_roles: dict[int, tuple[str, ...]] = {}
+    for arg_idx, arg in enumerate(args):
+        if not isinstance(arg, torch.Tensor):
+            continue
+        roles_obj = tensor_roles_obj.get(kernel_param_names[arg_idx])
+        if roles_obj is None:
+            continue
+        if not isinstance(roles_obj, (tuple, list)):
+            return None
+        roles = tuple(_role_value(role) for role in roles_obj)
+        if len(roles) != arg.ndim:
+            return None
+        arg_roles[arg_idx] = roles
+
+    def _has_supported_packed_role(arg_idx: int) -> bool:
+        roles = arg_roles.get(arg_idx, ())
+        return bool(roles) and roles[0] == "packed_m" and roles.count("packed_m") == 1
+
+    def _has_supported_group_role(arg_idx: int) -> bool:
+        roles = arg_roles.get(arg_idx, ())
+        return bool(roles) and roles[0] == "group" and roles.count("group") == 1
+
+    if not _has_supported_packed_role(out_arg):
+        return None
+    packed_input_args = [
+        idx
+        for idx in tensor_arg_indices
+        if idx != offsets_arg and _has_supported_packed_role(idx)
+    ]
+    group_input_args = [
+        idx
+        for idx in tensor_arg_indices
+        if idx != offsets_arg and _has_supported_group_role(idx)
+    ]
+    if len(packed_input_args) != 1 or not group_input_args:
+        return None
+    lhs_arg = packed_input_args[0]
+    lhs = args[lhs_arg]
+    if not isinstance(lhs, torch.Tensor) or lhs.ndim != 2:
+        return None
+    if lhs.dtype != out.dtype or lhs.shape[0] != out.shape[0]:
+        return None
+    for group_arg in group_input_args:
+        group_tensor = args[group_arg]
+        if not isinstance(group_tensor, torch.Tensor):
+            return None
+        if group_tensor.shape[0] != offsets.shape[0] - 1:
+            return None
+
+    tile_m_name = f"_BLOCK_SIZE_{jagged_block_id}"
+    tile_n_name = f"_BLOCK_SIZE_{output_block_id}"
+    tile_k_name = f"_BLOCK_SIZE_{reduction_block_id}"
+    tile_m = int(
+        grouped_m_plan.get("tile_m")
+        or getattr(pallas_kernel, "__globals__", {}).get(tile_m_name, 0)
+    )
+    tile_n = int(
+        grouped_m_plan.get("tile_n")
+        or getattr(pallas_kernel, "__globals__", {}).get(tile_n_name, 0)
+    )
+    tile_k = int(
+        grouped_m_plan.get("tile_k")
+        or getattr(pallas_kernel, "__globals__", {}).get(tile_k_name, 0)
+    )
+    if tile_m <= 0 or tile_n <= 0 or tile_k <= 0:
+        return None
+
+    n_rows = int(lhs.shape[0])
+    n_reduction = int(lhs.shape[1])
+    n_output = int(out.shape[1])
+    n_groups = int(offsets.shape[0]) - 1
+    sublane = min(pltpu.get_tpu_info().get_sublane_tiling(jnp.bfloat16), tile_m)
+    if tile_m % sublane != 0:
+        return None
+    max_num_gm = n_groups + (n_rows + tile_m - 1) // tile_m
+    grid_n = (n_output + tile_n - 1) // tile_n
+    grid_k = (n_reduction + tile_k - 1) // tile_k
+
+    @jax.tree_util.register_dataclass
+    @dataclasses.dataclass(frozen=True)
+    class _GroupedMMetadataRef:
+        group_offsets: object
+        gm_id_to_group_id: object
+        gm_id_to_m_tile_id: object
+        gm_id_to_m_offset: object
+
+    def _fill_metadata(offsets_ref: object, metadata_ref: object) -> object:
+        metadata_ref.gm_id_to_m_offset[0] = 0
+
+        def inner_tile_loop(
+            tm_id: object,
+            curr_m_offset: object,
+            *,
+            end_m_offset: object,
+            group_id: object,
+        ) -> object:
+            local_offset = curr_m_offset % sublane
+            tm_size = jnp.minimum(tile_m - local_offset, end_m_offset - curr_m_offset)
+            metadata_ref.gm_id_to_group_id[tm_id] = group_id
+            metadata_ref.gm_id_to_m_tile_id[tm_id] = curr_m_offset // tile_m
+            metadata_ref.gm_id_to_m_offset[tm_id] = curr_m_offset
+            next_m_offset = curr_m_offset + tm_size
+            metadata_ref.gm_id_to_m_offset[tm_id + 1] = next_m_offset
+            return next_m_offset
+
+        def group_loop(group_id: object, carry: object) -> tuple[object, object]:
+            num_gm, _prev_end = carry
+            start_m = offsets_ref[group_id]
+            end_m = offsets_ref[group_id + 1]
+            group_size = end_m - start_m
+            metadata_ref.group_offsets[group_id] = start_m
+            metadata_ref.group_offsets[group_id + 1] = end_m
+            local_offset = start_m % sublane
+            curr_num_gm = pl.cdiv(group_size + local_offset, tile_m)
+            curr_num_gm = jnp.where(group_size > 0, curr_num_gm, 0)
+            next_num_gm = num_gm + curr_num_gm
+            lax.fori_loop(
+                num_gm,
+                next_num_gm,
+                functools.partial(
+                    inner_tile_loop,
+                    end_m_offset=end_m,
+                    group_id=group_id,
+                ),
+                start_m,
+            )
+            return next_num_gm, end_m
+
+        num_gm, _ = lax.fori_loop(0, n_groups, group_loop, (0, 0))
+        return num_gm
+
+    def _tail_shape(arg_idx: int) -> tuple[int, ...]:
+        tensor = args[arg_idx]
+        assert isinstance(tensor, torch.Tensor)
+        return tuple(
+            _role_block_size(role, int(size))
+            for role, size in zip(arg_roles[arg_idx][1:], tensor.shape[1:], strict=True)
+        )
+
+    def _role_block_size(role: str, full_size: int) -> int:
+        if role == "output":
+            return tile_n
+        if role == "reduction":
+            return tile_k
+        return full_size
+
+    def _reshape_local_ref(arg_idx: int, ref: object) -> object:
+        roles = arg_roles[arg_idx]
+        if roles[0] == "packed_m":
+            return ref.reshape(-1, *_tail_shape(arg_idx))
+        if roles[0] == "group":
+            return ref.reshape(1, *_tail_shape(arg_idx))
+        return ref
+
+    class _IndexMaps:
+        def __init__(self, metadata_ref: object) -> None:
+            self.metadata_ref = metadata_ref
+
+        def packed_index_map(
+            self,
+            n_id: object,
+            gm_id: object,
+            k_id: object,
+            *,
+            arg_idx: int,
+        ) -> tuple[object, ...]:
+            m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+            m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+            row_start = m_start // sublane
+            if arg_idx == out_arg:
+                is_last_gm = gm_id == (pl.num_programs(1) - 1)
+                capped_end = m_end // sublane
+                last_end = pl.cdiv(m_end, sublane)
+                row_end = jnp.where(is_last_gm, last_end, capped_end)
+            else:
+                row_end = pl.cdiv(m_end, sublane)
+            tensor = args[arg_idx]
+            assert isinstance(tensor, torch.Tensor)
+            tail_indices = [
+                _role_grid_index(role, n_id=n_id, k_id=k_id)
+                for role in arg_roles[arg_idx][1:]
+            ]
+            return (pl.ds(row_start, row_end - row_start), 0, *tail_indices)
+
+        def group_index_map(
+            self,
+            n_id: object,
+            gm_id: object,
+            k_id: object,
+            *,
+            arg_idx: int,
+        ) -> tuple[object, ...]:
+            group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
+            tensor = args[arg_idx]
+            assert isinstance(tensor, torch.Tensor)
+            tail_indices = [
+                _role_grid_index(role, n_id=n_id, k_id=k_id)
+                for role in arg_roles[arg_idx][1:]
+            ]
+            return (group_id, *tail_indices)
+
+    def _role_grid_index(role: str, *, n_id: object, k_id: object) -> object:
+        if role == "output":
+            return n_id
+        if role == "reduction":
+            return k_id
+        return 0
+
+    def _block_spec(arg_idx: int, imaps: object) -> object:
+        tensor = args[arg_idx]
+        assert isinstance(tensor, torch.Tensor)
+        roles = arg_roles[arg_idx]
+        if roles[0] == "packed_m":
+            return pl.BlockSpec(
+                (
+                    pl.BoundedSlice(tile_m // sublane),
+                    sublane,
+                    *tuple(
+                        _role_block_size(role, int(size))
+                        for role, size in zip(roles[1:], tensor.shape[1:], strict=True)
+                    ),
+                ),
+                functools.partial(imaps.packed_index_map, arg_idx=arg_idx),
+            )
+        if roles[0] == "group":
+            return pl.BlockSpec(
+                (
+                    None,
+                    *tuple(
+                        _role_block_size(role, int(size))
+                        for role, size in zip(
+                            roles[1:], tensor.shape[1:], strict=True
+                        )
+                    ),
+                ),
+                functools.partial(imaps.group_index_map, arg_idx=arg_idx),
+                pipeline_mode=pl.Buffered(buffer_count=3),
+            )
+        return pl.BlockSpec(memory_space=pltpu.HBM)
+
+    pipeline_input_args = [
+        idx for idx in tensor_arg_indices if idx != offsets_arg and idx in arg_roles
+    ]
+    if not pipeline_input_args:
+        return None
+    if lhs_arg not in pipeline_input_args:
+        return None
+
+    compiler_scratch_shapes = _pallas_pipeline_scratch_shapes(
+        jnp,
+        pltpu,
+        scratch_shape_specs,
+    )
+    metadata_scratch = _GroupedMMetadataRef(
+        group_offsets=pltpu.SMEM((n_groups + 1,), jnp.int32),
+        gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+        gm_id_to_m_tile_id=pltpu.SMEM((max_num_gm,), jnp.int32),
+        gm_id_to_m_offset=pltpu.SMEM((max_num_gm + 1,), jnp.int32),
+    )
+    torch_to_jnp_dtype = {
+        torch.float32: jnp.float32,
+        torch.float16: jnp.float16,
+        torch.bfloat16: jnp.bfloat16,
+        torch.int32: jnp.int32,
+    }
+    out_jnp_dtype = torch_to_jnp_dtype.get(out.dtype, jnp.float32)
+    partial_out_scratch = pltpu.VMEM((sublane, tile_n), out_jnp_dtype)
+    reduction_acc_scratch = pltpu.VMEM((1, tile_m, tile_n), jnp.float32)
+    scratch_shapes = [
+        *compiler_scratch_shapes,
+        partial_out_scratch,
+        metadata_scratch,
+        reduction_acc_scratch,
+    ]
+
+    def _inner_kernel(*inner_refs: object) -> None:
+        n_inputs = len(pipeline_input_args)
+        input_refs = inner_refs[:n_inputs]
+        out_refs = inner_refs[n_inputs : n_inputs + len(output_indices)]
+        scratch_refs = inner_refs[n_inputs + len(output_indices) :]
+        if len(scratch_refs) != len(compiler_scratch_shapes) + 3:
+            return
+        compiler_scratch_refs = scratch_refs[: len(compiler_scratch_shapes)]
+        partial_out_ref = scratch_refs[-3]
+        metadata_ref = scratch_refs[-2]
+        reduction_acc_ref = scratch_refs[-1]
+        tiled_by_arg = {
+            arg_idx: _reshape_local_ref(arg_idx, ref)
+            for arg_idx, ref in zip(pipeline_input_args, input_refs, strict=True)
+        }
+        tiled_by_arg.update(
+            {
+                arg_idx: _reshape_local_ref(arg_idx, ref)
+                for arg_idx, ref in zip(output_indices, out_refs, strict=True)
+            }
+        )
+
+        user_refs = []
+        for arg_idx in range(len(args)):
+            if arg_idx == offsets_arg:
+                user_refs.append(metadata_ref.group_offsets)
+            elif arg_idx in tiled_by_arg:
+                user_refs.append(tiled_by_arg[arg_idx])
+            else:
+                return
+        pallas_kernel(
+            *user_refs,
+            *compiler_scratch_refs,
+            metadata_ref.group_offsets,
+            metadata_ref.gm_id_to_group_id,
+            metadata_ref.gm_id_to_m_tile_id,
+            metadata_ref.gm_id_to_m_offset,
+            reduction_acc_ref,
+            partial_out_ref,
+        )
+
+    def _kernel_main(offsets_ref: object, *refs: object) -> None:
+        input_refs = refs[: len(pipeline_input_args)]
+        out_refs = refs[
+            len(pipeline_input_args) : len(pipeline_input_args) + len(output_indices)
+        ]
+        scratch_refs = refs[len(pipeline_input_args) + len(output_indices) :]
+        if len(scratch_refs) != len(scratch_shapes):
+            return
+        metadata_ref = scratch_refs[-2]
+        num_gm = _fill_metadata(offsets_ref, metadata_ref)
+        imaps = _IndexMaps(metadata_ref)
+        pipeline_fn = pltpu.emit_pipeline(
+            _inner_kernel,
+            grid=(grid_n, num_gm, grid_k),
+            in_specs=tuple(_block_spec(idx, imaps) for idx in pipeline_input_args),
+            out_specs=_block_spec(out_arg, imaps),
+        )
+        pipeline_inputs = [
+            ref.reshape(-1, sublane, *args[arg_idx].shape[1:])  # type: ignore[union-attr]
+            if arg_roles[arg_idx][0] == "packed_m"
+            else ref
+            for arg_idx, ref in zip(pipeline_input_args, input_refs, strict=True)
+        ]
+        pipeline_outputs = [
+            ref.reshape(-1, sublane, *args[arg_idx].shape[1:])  # type: ignore[union-attr]
+            if arg_roles[arg_idx][0] == "packed_m"
+            else ref
+            for arg_idx, ref in zip(output_indices, out_refs, strict=True)
+        ]
+        pipeline_fn(
+            *pipeline_inputs,
+            *pipeline_outputs,
+            scratches=scratch_refs,
+        )
+
+    out_shape = (
+        out_shapes[0]
+        if isinstance(out_shapes, tuple) and len(out_shapes) == 1
+        else out_shapes
+    )
+
+    def grouped_m_pipeline_call(*jax_inputs: object) -> object:
+        offsets_jax = jax_inputs[arg_to_tensor_pos[offsets_arg]]
+        pipeline_jax_inputs = [
+            jax_inputs[arg_to_tensor_pos[arg_idx]] for arg_idx in pipeline_input_args
+        ]
+        call = pl.pallas_call(
+            _kernel_main,
+            out_shape=out_shape,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[
+                    *(
+                        pl.BlockSpec(memory_space=pltpu.HBM)
+                        for _ in pipeline_input_args
+                    ),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                disable_bounds_checks=True,
+            ),
+        )
+        return call(offsets_jax, *pipeline_jax_inputs)
+
+    return grouped_m_pipeline_call
+
+
 def default_pallas_pipeline_launcher(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1169,6 +1637,43 @@ def default_pallas_pipeline_launcher(
         ) = _pallas_prepare_args(
             args, _output_indices, _inplace_indices, interpret=interpret
         )
+
+        grouped_m_builder = kwargs.get("_grouped_m_pipeline_builder")
+        grouped_m_plan = kwargs.get("_grouped_m_plan")
+        if grouped_m_builder is not None and grouped_m_plan is not None:
+            direct_callable = grouped_m_builder(
+                pallas_kernel=pallas_kernel,
+                grid=grid,
+                args=args,
+                tensor_arg_indices=tensor_arg_indices,
+                arg_to_tensor_pos=arg_to_tensor_pos,
+                output_indices=_output_indices,
+                out_shapes=out_shapes,
+                grouped_m_plan=grouped_m_plan,
+                scratch_shape_specs=_scratch_shapes,
+            )
+            if direct_callable is not None:
+                jax_callable = _pallas_build_callable(
+                    pallas_kernel,
+                    grid,
+                    direct_callable,
+                    _output_indices,
+                    arg_to_tensor_pos,
+                    tensor_arg_indices,
+                    cache_attr="_pallas_pipeline_cache",
+                    call_aliases=pallas_aliases,
+                    trace_key_suffix="_grouped_m_pipeline",
+                    interpret=interpret,
+                )
+                return _pallas_invoke_and_return(
+                    jax_callable,
+                    args,
+                    tensor_arg_indices,
+                    arg_to_tensor_pos,
+                    _output_indices,
+                    _ds_pad_dims,
+                    _orig_output_tensors,
+                )
 
         assert _block_spec_info is not None, (
             "emit_pipeline launcher requires _block_spec_info from codegen"
