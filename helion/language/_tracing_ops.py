@@ -44,7 +44,7 @@ _symbolic_types = (torch.Tensor, torch.SymInt, torch.SymFloat, torch.SymBool)
 
 
 def is_for_loop_target(target: object) -> bool:
-    return target in (_for_loop, _for_loop_step)
+    return target in (_for_loop, _for_loop_step, _grouped_jagged_loop)
 
 
 @_decorators.api()
@@ -173,6 +173,23 @@ def _for_loop_step(
 
 
 @_decorators.codegen(_for_loop_step, "common")
+def _(state: CodegenState) -> None:
+    # pyrefly: ignore[bad-return]
+    return state.get_graph(state.proxy_arg(0)).codegen(state)
+
+
+@has_side_effect
+@_decorators.api()
+def _grouped_jagged_loop(
+    graph_id: int,
+    parent_block_ids: list[int],
+    args: list[object],
+) -> list[object]:
+    """Explicit grouped-M jagged loop request in FX form."""
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_grouped_jagged_loop, "common")
 def _(state: CodegenState) -> None:
     # pyrefly: ignore[bad-return]
     return state.get_graph(state.proxy_arg(0)).codegen(state)

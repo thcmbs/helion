@@ -43,6 +43,7 @@ from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
 from .ast_extension import create
 from .ast_extension import expr_from_string
+from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -298,6 +299,9 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
+    jagged_tile_schedules: dict[int, str | None] = dataclasses.field(
+        default_factory=dict
+    )
     # Host AST read/write names for this device loop body (siblings only; see
     # ``_ReadWriteVisitor.visit_For`` in ast_read_writes.py).  Used to insert
     # ``tl.debug_barrier()`` between loops when there is a global RAW dep.
@@ -317,6 +321,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         return {
             **super().kwargs(),
             "block_ids": [*self.block_ids],
+            "jagged_tile_schedules": dict(self.jagged_tile_schedules),
             "host_loop_reads": self.host_loop_reads,
             "host_loop_writes": self.host_loop_writes,
             # ``needs_barrier_before`` is excluded -- recomputed by GenerateAST
@@ -327,6 +332,13 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+        if (
+            state.config.get("pallas_loop_type") == "grouped_m_pipeline"
+            and len(self.block_ids) == 1
+        ):
+            axis = _grouped_m_pipeline_program_axis(state, self.block_ids[0])
+            if axis is not None:
+                return _codegen_grouped_m_pipeline_bound_loop(state, self, args, axis)
         # Make the active graph reachable by the strategy so it can pick
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
@@ -352,6 +364,160 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
     @property
     def name(self) -> str:
         return f"reduction_loop_{self.graph_id}"
+
+
+def _grouped_m_pipeline_program_axis(
+    state: CodegenState,
+    block_id: int,
+) -> int | None:
+    for plan in state.device_function.grouped_m_schedule_plans:
+        if plan.output_block_id == block_id:
+            return 0
+        if plan.reduction_block_id == block_id:
+            return 2
+    return None
+
+
+def _codegen_grouped_m_pipeline_bound_loop(
+    state: CodegenState,
+    graph_info: ForLoopGraphInfo,
+    args: list[ast.AST],
+    axis: int,
+) -> list[object]:
+    block_id = graph_info.block_ids[0]
+    strategy = state.device_function.tile_strategy.codegen_device_loop(
+        state,
+        graph_info.block_ids,
+    )
+    block_size_var = state.device_function.block_size_var(block_id)
+    assert block_size_var is not None
+    offset_var = strategy.strategy.offset_var(block_id)
+    index_var = strategy.strategy.index_var(block_id)
+    env = CompileEnvironment.current()
+    dtype = env.index_type()
+    body = strategy.inner_statements
+    graph_args = args
+    if axis == 2 and args:
+        graph_args = [*args]
+        graph_args[0] = expr_from_string(
+            "jnp.where(pl.program_id(2) == 0, {init}, _helion_reduction_acc_ref[...])",
+            init=args[0],
+        )
+    body.extend(
+        [
+            statement_from_string(
+                f"{offset_var} = pl.program_id({axis}) * {block_size_var}"
+            ),
+            statement_from_string(
+                f"{index_var} = {offset_var} + jnp.arange(0, {block_size_var}, dtype={dtype})"
+            ),
+        ]
+    )
+    with state.codegen.set_statements(body):
+        for idx in strategy.block_ids:
+            active_loops = state.codegen.active_device_loops[idx]
+            active_loops.append(strategy)
+            if len(active_loops) > 1:
+                raise exc.NestedDeviceLoopsConflict
+        try:
+            result = codegen_call_with_graph(state.codegen, graph_info.graph, graph_args)
+        finally:
+            for idx in strategy.block_ids:
+                state.codegen.active_device_loops[idx].pop()
+    if axis == 2 and isinstance(result, (list, tuple)) and result:
+        acc_result = result[0]
+        if isinstance(acc_result, ast.AST):
+            fn_name = state.device_function.new_var("_store_reduction_acc", dce=True)
+            body.append(
+                statement_from_string(
+                    f"@pl.when(pl.program_id(2) != pl.num_programs(2) - 1)\n"
+                    f"def {fn_name}():\n"
+                    f"    _helion_reduction_acc_ref[...] = {{acc}}",
+                    acc=acc_result,
+                )
+            )
+    state.codegen.statements_stack[-1].extend(body)
+    return result
+
+
+@dataclasses.dataclass
+class GroupedJaggedLoopGraphInfo(ForLoopGraphInfo):
+    parent_block_ids: list[int] = dataclasses.field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return f"grouped_jagged_loop_{self.graph_id}"
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            **super().kwargs(),
+            "parent_block_ids": [*self.parent_block_ids],
+        }
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        args = state.ast_args[2]
+        proxy_args = state.proxy_args[2]
+        assert isinstance(args, list)
+        assert isinstance(proxy_args, list)
+        assert args and proxy_args
+        assert all(isinstance(x, ast.AST) for x in args)
+        block_id = self.block_ids[0]
+        block_size_var = state.device_function.block_size_var(block_id)
+        assert block_size_var is not None
+        block_size_proxy = CompileEnvironment.current().block_sizes[block_id].symbol()
+        gm_id = (
+            "pl.program_id(1)"
+            if state.config.get("pallas_loop_type") == "grouped_m_pipeline"
+            else "pl.program_id(0)"
+        )
+        group_id = f"_helion_group_ids[{gm_id}]"
+        metadata_args = [*args]
+        metadata_args[0] = expr_from_string(
+            "jnp.expand_dims("
+            f"_helion_group_offsets[{group_id} + 1] "
+            f"- _helion_group_offsets[{group_id}], axis=0)"
+        )
+        synthetic_state = CodegenState(
+            state.codegen,
+            state.fx_node,
+            state.env,
+            proxy_args=[state.proxy_args[0], [0], [block_size_proxy], proxy_args],
+            ast_args=[
+                state.ast_args[0],
+                [0],
+                [expr_from_string(block_size_var)],
+                metadata_args,
+            ],
+        )
+        device_loop = state.device_function.tile_strategy.codegen_device_loop(
+            synthetic_state,
+            self.block_ids,
+        )
+        local_start = (
+            f"(_helion_m_tile_ids[{gm_id}] * {block_size_var})"
+            f" - _helion_group_offsets[{group_id}]"
+        )
+        with state.codegen.set_statements(device_loop.inner_statements):
+            for idx in device_loop.block_ids:
+                active_loops = state.codegen.active_device_loops[idx]
+                active_loops.append(device_loop)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                codegen_call_with_graph(state.codegen, self.graph, metadata_args)
+            finally:
+                for idx in device_loop.block_ids:
+                    state.codegen.active_device_loops[idx].pop()
+
+        state.codegen.statements_stack[-1].extend(device_loop.outer_prefix)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{device_loop.strategy.offset_var(block_id)} = {local_start}"
+            )
+        )
+        state.codegen.statements_stack[-1].extend(device_loop.inner_statements)
+        state.codegen.statements_stack[-1].extend(device_loop.outer_suffix)
+        return []
 
 
 @dataclasses.dataclass
@@ -1327,6 +1493,7 @@ class WalkDeviceAST(NodeVisitor):
             begin, end, step = self._extract_tile_range(
                 node, supports_step=supports_step
             )
+            grouped_jagged_parent_ids: list[int] | None = None
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
                 if begin is None:
@@ -1338,14 +1505,24 @@ class WalkDeviceAST(NodeVisitor):
                     # hl.jagged_tile takes an N-D parent tensor, not a scalar bound.
                     assert isinstance(end, torch.Tensor)
                     jagged_parent = end
+                    schedule = CompileEnvironment.current().jagged_tile_schedule(
+                        inner_type.block_id
+                    )
 
                     # The first lifted loop input must be the jagged parent tensor.
                     # _setup_mask uses that parent tensor to recover each lane's true end.
                     assert inputs.flat_values[0] is jagged_parent
 
-                    # Flatten so the global max becomes a single-axis reduction —
-                    # Inductor only supports one reduction dim per buffer.
-                    end = torch.amax(jagged_parent.reshape(-1))
+                    if schedule == "grouped_m":
+                        grouped_jagged_parent_ids = [
+                            *CompileEnvironment.current().jagged_tile_parent_ids[
+                                inner_type.block_id
+                            ]
+                        ]
+                    else:
+                        # Flatten so the global max becomes a single-axis reduction —
+                        # Inductor only supports one reduction dim per buffer.
+                        end = torch.amax(jagged_parent.reshape(-1))
 
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
@@ -1370,13 +1547,32 @@ class WalkDeviceAST(NodeVisitor):
             graph_idx, outputs = self._trace_graph(
                 inputs,
                 build_subgraph,
-                graph_info_cls=ForLoopGraphInfo,
+                graph_info_cls=GroupedJaggedLoopGraphInfo
+                if grouped_jagged_parent_ids is not None
+                else ForLoopGraphInfo,
                 block_ids=block_ids,
+                jagged_tile_schedules={
+                    bid: CompileEnvironment.current().jagged_tile_schedule(bid)
+                    for bid in block_ids
+                    if CompileEnvironment.current().is_jagged_tile(bid)
+                },
+                **(
+                    {"parent_block_ids": grouped_jagged_parent_ids}
+                    if grouped_jagged_parent_ids is not None
+                    else {}
+                ),
                 host_loop_reads=host_reads,
                 host_loop_writes=host_writes,
             )
             step_list = step if isinstance(step, list) else None
-            if step_list is None or all(s is None for s in step_list):
+            if grouped_jagged_parent_ids is not None:
+                args = (
+                    graph_idx,
+                    grouped_jagged_parent_ids,
+                    inputs.get_tensor_args(),
+                )
+                loop_target = _tracing_ops._grouped_jagged_loop
+            elif step_list is None or all(s is None for s in step_list):
                 args = (
                     graph_idx,
                     begin,

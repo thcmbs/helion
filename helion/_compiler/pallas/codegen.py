@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import collections.abc
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,9 @@ def load_expr(
 
     assert state.fx_node is not None
     patterns = state.fx_node.meta.get("indexing_patterns") or ()
+    grouped_metadata_load = _maybe_grouped_m_metadata_load(state, tensor, patterns)
+    if grouped_metadata_load is not None:
+        return grouped_metadata_load
     for pattern in patterns:
         if isinstance(pattern, IndirectGatherPattern):
             return emit_gather(state, pattern.plan, name)
@@ -44,7 +48,48 @@ def load_expr(
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
         )
+    grouped_expand_dims = _collapsed_grouped_tensor_index_singleton_axes(
+        state,
+        subscript,
+        patterns,
+    )
+    for dim in grouped_expand_dims:
+        result = expr_from_string(
+            f"jnp.expand_dims({{result}}, axis={dim})", result=result
+        )
     return result
+
+
+def _maybe_grouped_m_metadata_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    patterns: object,
+) -> ast.AST | None:
+    if state.config.get("pallas_loop_type") != "grouped_m_pipeline":
+        return None
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    pattern_list = list(patterns)
+    if len(pattern_list) != 1:
+        return None
+    for plan in state.device_function.grouped_m_schedule_plans:
+        if tensor is not plan.offsets:
+            continue
+        pattern = pattern_list[0]
+        if isinstance(pattern, TilePattern) and pattern.block_id == plan.group_block_id:
+            return expr_from_string(
+                "jnp.expand_dims(_helion_group_offsets[_helion_group_ids[pl.program_id(1)]], axis=0)"
+            )
+        if (
+            isinstance(pattern, TileIndexWithOffsetPattern)
+            and pattern.block_id == plan.group_block_id
+            and pattern.offset == 1
+        ):
+            return expr_from_string(
+                "jnp.expand_dims(_helion_group_offsets[_helion_group_ids[pl.program_id(1)] + 1], axis=0)"
+            )
+    return None
 
 
 def _load_mask_expr(
@@ -142,10 +187,21 @@ def sliced_value_for_store(
     slices: list[str] = []
     needs_slice = False
     tensor_dim = 0
+    collapsed_axes = set(
+        _collapsed_grouped_tensor_index_singleton_axes(state, subscript, patterns)
+    )
 
     index_part_idx = 0
+    out_pos = 0
     for idx, pattern in zip(subscript, patterns, strict=True):
+        while out_pos in collapsed_axes:
+            slices.append("0")
+            needs_slice = True
+            out_pos += 1
+
         if idx is None:
+            slices.append(":")
+            out_pos += 1
             continue
 
         value_slice = ":"
@@ -163,7 +219,13 @@ def sliced_value_for_store(
                 needs_slice = True
 
         slices.append(value_slice)
+        out_pos += 1
         tensor_dim += 1
+
+    while out_pos in collapsed_axes:
+        slices.append("0")
+        needs_slice = True
+        out_pos += 1
 
     if not needs_slice:
         return value
@@ -315,6 +377,7 @@ def _generated_index_code(
     """Generate index code based on the indexing pattern."""
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
+    from helion._compiler.pallas.plan_tiling import GroupedJaggedIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
@@ -330,6 +393,15 @@ def _generated_index_code(
     if isinstance(pattern, TileBeginWithOffsetPattern):
         return _tile_begin_with_offset_pattern_code(
             pattern, state, subscript_index, tensor_dim
+        )
+
+    if isinstance(pattern, GroupedJaggedIndexPattern):
+        return _grouped_jagged_index_pattern_code(
+            pattern,
+            state,
+            subscript_index,
+            tensor,
+            tensor_dim,
         )
 
     if isinstance(pattern, ArbitrarySlicePattern):
@@ -433,6 +505,160 @@ def _tile_begin_with_offset_pattern_code(
     return f"{pattern.offset}"
 
 
+def _grouped_jagged_index_pattern_code(
+    pattern: object,
+    state: CodegenState,
+    subscript_index: int,
+    tensor: torch.Tensor,
+    tensor_dim: int,
+) -> str:
+    from helion._compiler.pallas.plan_tiling import GroupedJaggedIndexPattern
+
+    assert isinstance(pattern, GroupedJaggedIndexPattern)
+    if state.config.get("pallas_loop_type") == "grouped_m_pipeline":
+        return ":"
+
+    block_size = state.device_function.block_size_var(pattern.block_id)
+    if block_size is None:
+        return _index_expr_from_ast(state, subscript_index)
+
+    ast_subscripts = state.ast_args[1]
+    assert isinstance(ast_subscripts, list)
+    ast_idx = ast_subscripts[subscript_index]
+    assert isinstance(ast_idx, ast.AST)
+    index_name = state.codegen.lift(ast_idx, dce=True, prefix="grouped_jagged_index")
+    from helion.language.memory_ops import _record_pad_info
+
+    _record_pad_info(state, tensor, tensor_dim, pattern.block_id, 0)
+    first_element_index = ", ".join("0" for _ in range(pattern.index_ndim))
+    first_element = f"({index_name.id})[{first_element_index}]"
+    return f"pl.ds(pl.multiple_of({first_element}, {block_size}), {block_size})"
+
+
+def _collapsed_grouped_tensor_index_singleton_axes(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    patterns: object,
+) -> list[int]:
+    import torch.fx
+
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import GroupedJaggedIndexPattern
+    from helion._compiler.pallas.plan_tiling import TilePattern
+
+    pattern_list = list(patterns)
+    grouped_positions = [
+        i
+        for i, pattern in enumerate(pattern_list)
+        if isinstance(pattern, GroupedJaggedIndexPattern)
+    ]
+    if not grouped_positions:
+        return []
+    assert state.fx_node is not None
+    fx_subscript = state.fx_node.args[1]
+    if not isinstance(fx_subscript, collections.abc.Sequence):
+        return []
+
+    def tensor_index_shape(idx: object) -> tuple[object, ...] | None:
+        if isinstance(idx, torch.fx.Node):
+            idx_val = idx.meta.get("val")
+        else:
+            idx_val = idx if isinstance(idx, torch.Tensor) else None
+        if not isinstance(idx_val, torch.Tensor):
+            return None
+        return tuple(idx_val.shape)
+
+    pos = grouped_positions[0]
+    start = pos
+    while start > 0 and tensor_index_shape(fx_subscript[start - 1]) is not None:
+        start -= 1
+    end = pos + 1
+    while end < len(fx_subscript) and tensor_index_shape(fx_subscript[end]) is not None:
+        end += 1
+
+    shapes = [tensor_index_shape(idx) for idx in fx_subscript[start:end]]
+    if any(shape is None for shape in shapes):
+        return []
+    tensor_shapes = [shape for shape in shapes if shape is not None]
+    broadcast_shape = _right_broadcast_shape(tensor_shapes)
+    if not broadcast_shape:
+        return []
+
+    env = CompileEnvironment.current()
+
+    def is_effective_one(size: object) -> bool:
+        if isinstance(size, int) and size == 1:
+            return True
+        block_id = env.get_block_id(size)
+        if block_id is None:
+            return False
+        block_size = env.block_sizes[block_id].from_config(state.config)
+        return isinstance(block_size, int) and block_size == 1
+
+    represented_broadcast_dims: set[int] = set()
+    rank = len(broadcast_shape)
+    for shape, pattern in zip(tensor_shapes, pattern_list[start:end], strict=True):
+        if not isinstance(pattern, (GroupedJaggedIndexPattern, TilePattern)):
+            continue
+        padded_shape = (1,) * (rank - len(shape)) + tuple(shape)
+        for dim, size in enumerate(padded_shape):
+            if is_effective_one(size):
+                continue
+            block_id = env.get_block_id(size)
+            if block_id == pattern.block_id:
+                represented_broadcast_dims.add(dim)
+
+    output_start = _output_position_before_tensor_index_group(
+        subscript,
+        pattern_list,
+        start,
+    )
+    return [
+        output_start + dim
+        for dim, size in enumerate(broadcast_shape)
+        if is_effective_one(size) and dim not in represented_broadcast_dims
+    ]
+
+
+def _right_broadcast_shape(shapes: list[tuple[object, ...]]) -> tuple[object, ...]:
+    rank = max((len(shape) for shape in shapes), default=0)
+    result: list[object] = []
+    for dim in range(rank):
+        sizes = [
+            shape[dim - (rank - len(shape))]
+            if dim >= rank - len(shape)
+            else 1
+            for shape in shapes
+        ]
+        non_one = [size for size in sizes if not (isinstance(size, int) and size == 1)]
+        result.append(non_one[0] if non_one else 1)
+    return tuple(result)
+
+
+def _output_position_before_tensor_index_group(
+    subscript: list[object] | tuple[object, ...],
+    patterns: list[object],
+    group_start: int,
+) -> int:
+    from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+    from helion._compiler.pallas.plan_tiling import NonePattern
+    from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+
+    output_pos = 0
+    for _idx, pattern in zip(
+        subscript[:group_start],
+        patterns[:group_start],
+        strict=True,
+    ):
+        if isinstance(pattern, NonePattern):
+            output_pos += 1
+        elif isinstance(pattern, (ArbitraryIndexPattern, TileBeginWithOffsetPattern)):
+            continue
+        else:
+            output_pos += 1
+    return output_pos
+
+
 def _index_expr_from_ast(state: CodegenState, subscript_index: int) -> str:
     ast_subscripts = state.ast_args[1]
     assert isinstance(ast_subscripts, list)
@@ -483,6 +709,10 @@ def _ds_expr(
     When *tensor* and *tensor_dim* are provided, records the dimension in
     ``pallas_pad_info`` so the launcher can zero-pad non-divisible dims.
     """
+    if state.config.get("pallas_loop_type") == "grouped_m_pipeline":
+        for plan in state.device_function.grouped_m_schedule_plans:
+            if block_id in (plan.output_block_id, plan.reduction_block_id):
+                return ":"
     offset = state.codegen.offset_var(block_id)
     if tile_offset:
         offset = f"{offset} + {tile_offset}"

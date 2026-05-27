@@ -47,6 +47,27 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+def _grouped_m_plan_for_parent(
+    device_function: DeviceFunction,
+    block_id: int,
+) -> object | None:
+    for plan in device_function.grouped_m_schedule_plans:
+        if plan.group_block_id == block_id:
+            return plan
+    return None
+
+
+def _is_grouped_m_pipeline_local_grid_axis(
+    state: CodegenState,
+    block_id: int,
+) -> bool:
+    if state.config.get("pallas_loop_type") != "grouped_m_pipeline":
+        return False
+    if not state.device_function.grouped_m_schedule_plans:
+        return False
+    return _grouped_m_plan_for_parent(state.device_function, block_id) is None
+
+
 class ThreadAxisTracker:
     """Tracks thread axis assignments for block dimensions during codegen."""
 
@@ -1536,12 +1557,24 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(state, block_size_var, block_size)
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
-                )
+                if _is_grouped_m_pipeline_local_grid_axis(state, block_idx):
+                    state.add_statement(f"{offset_var} = 0")
+                else:
+                    state.add_statement(
+                        f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
+                    )
             else:
                 block_size_var = "1"
-                state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
+                grouped_plan = _grouped_m_plan_for_parent(
+                    state.device_function,
+                    block_idx,
+                )
+                if grouped_plan is not None:
+                    state.add_statement(f"{offset_var} = _helion_group_ids[pl.program_id(1)]")
+                elif _is_grouped_m_pipeline_local_grid_axis(state, block_idx):
+                    state.add_statement(f"{offset_var} = 0")
+                else:
+                    state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
             axis = thread_axis_offset + thread_axis_map[block_idx]
             # Inactive block_ids never claim a CUDA thread axis (per
             # ``_thread_axis_map``); without the polymorphic
