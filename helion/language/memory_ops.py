@@ -318,6 +318,7 @@ def _(state: CodegenState) -> None:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    value_proxy = state.proxy_arg(2)
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     name = state.device_function.tensor_arg(tensor).name
@@ -347,6 +348,15 @@ def _(state: CodegenState) -> None:
         value = emit_scatter_store(
             state, scatter_patterns[0].plan, name, idx_str, value
         )
+    else:
+        mask_expr = pallas_codegen.store_mask_expr(
+            state, list(subscript), tensor, value_proxy
+        )
+        if mask_expr is not None:
+            value = expr_from_string(
+                f"{{value}} * ({mask_expr}) + {name}[{idx_str}] * (1 - ({mask_expr}))",
+                value=value,
+            )
     state.codegen.add_statement(
         statement_from_string(f"{name}[{idx_str}] = {{value}}", value=value)
     )

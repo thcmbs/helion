@@ -508,6 +508,33 @@ def kernel_tile_begin_plus_offset_is_elementwise(
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_dynamic_tile_store_masks_partial_jagged_bmm_tile(
+        self,
+    ) -> None:
+        """Partial dynamic M tiles should not store past a sublane-aligned end."""
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            autotune_effort="none",
+            config=helion.Config(block_sizes=[16]),
+        )
+        def update_prefix(
+            x: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            for tile_m in hl.tile(128):
+                out[tile_m] = x[tile_m] + 1
+            return out
+
+        x = torch.arange(256, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.full((256,), -7, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(update_prefix, (x, out), block_sizes=[256])
+
+        expected = torch.full_like(result, -7)
+        expected[:128] = x[:128] + 1
+        torch.testing.assert_close(result, expected)
+
     def test_estimate_pallas_vmem_bytes(self) -> None:
         """VMEM OOM: Tests that block sizes and dtypes (fp32, bf16) are correctly estimated."""
 

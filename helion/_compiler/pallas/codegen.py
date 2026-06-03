@@ -64,17 +64,31 @@ def _load_mask_expr(
     ref to the actual remainder are not masked — a block-sized mask would
     cause a shape mismatch against the smaller ref.
     """
-    from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.pallas.plan_tiling import TilePattern
-
     assert state.fx_node is not None
     output_val = state.fx_node.meta.get("val")
     if not isinstance(output_val, torch.Tensor):
         return None
+    return _tile_mask_expr(
+        state,
+        subscript,
+        tensor,
+        [*output_val.size()],
+        dtype=tensor.dtype,
+    )
+
+
+def _tile_mask_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    output_sizes: list[object],
+    dtype: torch.dtype | None,
+) -> str | None:
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.plan_tiling import TilePattern
 
     indexing_patterns = _get_indexing_patterns(state, tensor)
     env = CompileEnvironment.current()
-    output_sizes = [*output_val.size()]
     mask_exprs: list[str] = []
     dtype_str: str | None = None
     out_dim = 0
@@ -96,10 +110,13 @@ def _load_mask_expr(
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
-                    if dtype_str is None:
+                    if dtype is not None and dtype_str is None:
                         dtype_str = env.backend.dtype_str(tensor.dtype)
                     expand = state.tile_strategy.expand_str(output_sizes, out_dim)
-                    expr = f"({mask_var}.astype({dtype_str}){expand})"
+                    if dtype_str is None:
+                        expr = f"({mask_var}{expand})"
+                    else:
+                        expr = f"({mask_var}.astype({dtype_str}){expand})"
                     mask_exprs.append(expr)
 
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
@@ -110,6 +127,25 @@ def _load_mask_expr(
     if not mask_exprs:
         return None
     return "*".join(mask_exprs)
+
+
+def store_mask_expr(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    value_proxy: object,
+) -> str | None:
+    """Build the automatic tile mask for a Pallas store.
+
+    Dynamic ``hl.tile(begin, end)`` loops can produce a full block-sized Pallas
+    ref while only the prefix up to ``end`` is logically valid. Loads already
+    zero masked rows; stores must also avoid overwriting rows outside the
+    logical tile.
+    """
+    output_sizes = (
+        [*value_proxy.size()] if isinstance(value_proxy, torch.Tensor) else []
+    )
+    return _tile_mask_expr(state, subscript, tensor, output_sizes, dtype=tensor.dtype)
 
 
 def sliced_value_for_store(
