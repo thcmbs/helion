@@ -439,7 +439,10 @@ def make_pallas_paired_device_micros_bench(
     Otherwise the closure has the :func:`paired_device_micros_bench` signature and
     captures ``n_calls`` / ``n_warmup``.
     """
-    if not _autotune_rank_by_device_micros():
+    # Interpret mode runs on CPU: there is no /device:TPU:0 profiler plane,
+    # so the device-us measurement always returns inf. Skip the verification
+    # pass instead of paying its warmup/trace calls and compiles for nothing.
+    if is_pallas_interpret() or not _autotune_rank_by_device_micros():
         return None
 
     def _bench(
