@@ -336,6 +336,7 @@ def _(
             raise exc.FailedToUnpackTile from None
 
     results = []
+    static_bounds: list[bool] = []
     has_data_dependent_bounds = False
     has_symbolic_bounds = False
     for begin_part, end_part, bs in zip(
@@ -354,6 +355,7 @@ def _(
             has_data_dependent_bounds = True
         if isinstance(begin_part, torch.SymInt) or isinstance(end_part, torch.SymInt):
             has_symbolic_bounds = True
+        static_bounds.append(isinstance(size, int))
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -379,6 +381,7 @@ def _(
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
         has_symbolic_bounds=has_symbolic_bounds,
+        static_bounds=static_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -396,6 +399,7 @@ def _add_config_choices(
     allow_static_ranges: list[bool] | None = None,
     has_data_dependent_bounds: bool = False,
     has_symbolic_bounds: bool = False,
+    static_bounds: list[bool] | None = None,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -442,6 +446,12 @@ def _add_config_choices(
     else:
         if config_spec.backend_name == "pallas":
             config_spec.has_pallas_inner_loops = True
+            if static_bounds is None:
+                static_bounds = [False] * len(block_ids)
+            for block_id, is_static in zip(block_ids, static_bounds, strict=True):
+                config_spec.register_pallas_fori_loop(
+                    block_id=block_id, is_static=is_static
+                )
         if allow_static_ranges is None:
             allow_static_ranges = [False] * len(block_ids)
         for block_id, allow_static_range in zip(
@@ -945,6 +955,7 @@ def _(
         step_list = cast("list[int | torch.SymInt | torch.Tensor | None]", proxy_step)
 
     results = []
+    static_bounds: list[bool] = []
     has_data_dependent_bounds = False
     for begin_part, end_part, step_part in zip(
         begin_list,
@@ -958,6 +969,9 @@ def _(
             has_data_dependent_bounds = True
         if step_part is None:
             step_part = 1
+        static_bounds.append(
+            isinstance(size, int) and not isinstance(step_part, torch.Tensor)
+        )
         # pyrefly: ignore [bad-argument-type]
         results.append(GridIndexType.allocate(size, origin, step_part))
 
@@ -971,6 +985,7 @@ def _(
             )
         ],
         has_data_dependent_bounds=has_data_dependent_bounds,
+        static_bounds=static_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:

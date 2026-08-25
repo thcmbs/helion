@@ -107,6 +107,9 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pallas_load_buffer_count": st.lists(
                 st.integers(min_value=1, max_value=2), max_size=4
             ),
+            "pallas_fori_loop_unroll_factors": st.lists(
+                st.sampled_from([1, 2, 4, 8]), max_size=4
+            ),
             "pallas_indirect_access_mode": st.sampled_from(["dma", "one_hot"]),
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
@@ -146,6 +149,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_flattens",
                     "static_ranges",
                     "pallas_load_buffer_count",
+                    "pallas_fori_loop_unroll_factors",
                     "pallas_indirect_access_mode",
                     "load_eviction_policies",
                     "load_cache_modifiers",
@@ -257,6 +261,97 @@ class TestPallasLoadBufferCountConfig(TestCase):
             )
 
 
+class TestPallasForiLoopUnrollFactorConfig(TestCase):
+    @staticmethod
+    def _config_spec(
+        *,
+        has_pallas_inner_loops: bool = True,
+        static: tuple[bool, ...] = (True,),
+    ) -> ConfigSpec:
+        spec = ConfigSpec(backend=PallasBackend())
+        spec.has_pallas_inner_loops = has_pallas_inner_loops
+        if has_pallas_inner_loops:
+            for block_id, is_static in enumerate(static):
+                spec.register_pallas_fori_loop(block_id=block_id, is_static=is_static)
+        return spec
+
+    def test_default_and_search_surface(self) -> None:
+        spec = self._config_spec(static=(True, False))
+        field = spec._flat_fields()["pallas_fori_loop_unroll_factors"]
+        fragment = field[0]._fragment(spec)
+        self.assertEqual(fragment.default(), 1)
+        self.assertEqual(fragment.search_values(), [1, 2, 4, 8])
+        self.assertEqual(field[1]._fragment(spec).search_values(), [1])
+
+        config = helion.Config(pallas_loop_type="fori_loop")
+        spec.normalize(config)
+        self.assertEqual(config.pallas_fori_loop_unroll_factors, [1, 1])
+
+        config = helion.Config(
+            pallas_loop_type="fori_loop", pallas_fori_loop_unroll_factors=[8, 1]
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_fori_loop_unroll_factors, [8, 1])
+
+    def test_round_trip(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._config_spec(static=(True, False))
+        config = helion.Config(
+            pallas_loop_type="fori_loop", pallas_fori_loop_unroll_factors=[4, 1]
+        )
+        spec.normalize(config)
+        generation = ConfigGeneration(spec)
+        round_trip = generation.unflatten(generation.flatten(config))
+        self.assertEqual(round_trip.pallas_fori_loop_unroll_factors, [4, 1])
+
+    def test_dynamic_loop_registration_wins(self) -> None:
+        # A block_id shared by a static and a dynamic loop must stay pinned
+        # at 1: jax rejects unroll>1 when the fori_loop bounds are traced.
+        spec = self._config_spec()
+        spec.register_pallas_fori_loop(block_id=0, is_static=False)
+        self.assertNotIn("pallas_fori_loop_unroll_factors", spec._flat_fields())
+
+    def test_inactive_field_is_ignored(self) -> None:
+        cases = (
+            (self._config_spec(), "emit_pipeline", True),
+            (self._config_spec(has_pallas_inner_loops=False), "fori_loop", False),
+            (self._config_spec(static=(False,)), "fori_loop", False),
+        )
+        for spec, loop_type, present_in_search in cases:
+            with self.subTest(loop_type=loop_type):
+                self.assertEqual(
+                    "pallas_fori_loop_unroll_factors" in spec._flat_fields(),
+                    present_in_search,
+                )
+                config = helion.Config(
+                    pallas_loop_type=loop_type,
+                    pallas_fori_loop_unroll_factors=[4],
+                )
+                spec.normalize(config)
+                self.assertNotIn("pallas_fori_loop_unroll_factors", config)
+
+    def test_non_pallas_backend_rejects_the_field(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "Unsupported config keys for backend 'triton'",
+        ):
+            spec.normalize(helion.Config(pallas_fori_loop_unroll_factors=[2]))
+
+    def test_rejects_invalid_values(self) -> None:
+        spec = self._config_spec()
+        for value in (None, True, 0, -1, 1.5, 3, 16):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                config = helion.Config.from_dict(
+                    {
+                        "pallas_loop_type": "fori_loop",
+                        "pallas_fori_loop_unroll_factors": [value],
+                    }
+                )
+                spec.normalize(config)
+
+
 @onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
     def test_config_import_path_stability(self) -> None:
@@ -305,6 +400,7 @@ class TestConfigAPI(TestCase):
             "range_flattens",
             "static_ranges",
             "pallas_load_buffer_count",
+            "pallas_fori_loop_unroll_factors",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",

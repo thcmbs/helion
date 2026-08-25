@@ -4068,13 +4068,18 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     # not affect correctness; for loop-carried state the user's source order
     # (block_ids order) is the correct semantic order.
     current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    unroll_factors = state.config.pallas_fori_loop_unroll_factors
     for dim in reversed(range(len(loop_vars))):
+        unroll_factor = env.config_spec.pallas_fori_loop_unroll_factors.config_get(
+            unroll_factors, block_ids[dim], 1
+        )
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
         assert isinstance(fn_def, ast.FunctionDef)
         fn_def.body = current_body  # pyrefly: ignore[bad-assignment]
         fori_call = statement_from_string(
-            f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
+            f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None, "
+            f"unroll={unroll_factor})"
         )
         call_prefix = prime_statements if dim == len(loop_vars) - 1 else []
         if dim == 0:

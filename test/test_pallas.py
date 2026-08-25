@@ -3503,6 +3503,27 @@ class TestPallas(TestCase):
         # out is output-only, excluded from pallas_call inputs
         self.assertIn("_inplace_indices=[]", code)
 
+    def test_fori_loop_unroll_factor_codegen(self) -> None:
+        args = (
+            torch.randn(64, 1024, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 1024, device=DEVICE, dtype=torch.float32),
+        )
+        spec = pallas_inner_loop_add.bind(args).env.config_spec
+        field = spec._flat_fields()["pallas_fori_loop_unroll_factors"]
+        self.assertEqual(field[0]._fragment(spec).search_values(), [1, 2, 4, 8])
+        code, result = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[8, 128],
+            pallas_loop_type="fori_loop",
+            pallas_fori_loop_unroll_factors=[8],
+        )
+        self.assertRegex(
+            code,
+            r"jax\.lax\.fori_loop\(0, [^,]+, _fori_body_0, None, unroll=8\)",
+        )
+        torch.testing.assert_close(result, args[0] + args[1])
+
     def _assert_load_buffer_count_noop(
         self,
         kernel: helion.Kernel,
@@ -4766,8 +4787,11 @@ class TestPallas(TestCase):
             args,
             block_sizes=[1, 8, 128],
             pallas_loop_type="fori_loop",
+            pallas_fori_loop_unroll_factors=[4, 1],
         )
         self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
+        self.assertRegex(code, r"_fori_body_1, None, unroll=1\)")
+        self.assertRegex(code, r"_fori_body_0, None, unroll=4\)")
         torch.testing.assert_close(result, args[0] + args[1])
 
     def test_unroll_loop_multidim_non_divisible(self) -> None:

@@ -43,6 +43,7 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
+        pallas_fori_loop_unroll_factors: list[int] | None = None,
         load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
@@ -77,6 +78,8 @@ class Config(Mapping[str, object]):
             pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
+            pallas_fori_loop_unroll_factors: Pallas-only unroll factors for
+                ``jax.lax.fori_loop`` inner loops.
             load_eviction_policies: Eviction policies for load operations ("", "first", "last").
             load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             store_cache_modifiers: Cache modifiers for store operations ("", ".cs", ".wt").
@@ -122,6 +125,7 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "pallas_load_buffer_count": pallas_load_buffer_count,
+            "pallas_fori_loop_unroll_factors": pallas_fori_loop_unroll_factors,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
@@ -326,6 +330,10 @@ class Config(Mapping[str, object]):
     @property
     def pallas_load_buffer_count(self) -> list[int]:
         return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
+
+    @property
+    def pallas_fori_loop_unroll_factors(self) -> list[int]:
+        return cast("list[int]", self.config.get("pallas_fori_loop_unroll_factors", []))
 
     @property
     def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:

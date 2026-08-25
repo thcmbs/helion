@@ -70,6 +70,11 @@ Configs are typically discovered automatically through autotuning, but can also 
 
    Unroll factors for ``tl.range`` loops in generated Triton code.
 
+.. autoattribute:: Config.pallas_fori_loop_unroll_factors
+
+   Per-loop unroll factors for ``jax.lax.fori_loop`` inner loops in generated
+   Pallas code. One of 1, 2, 4, or 8 per loop; loops with dynamic bounds use 1.
+
 .. autoattribute:: Config.range_warp_specializes
 
    Whether to enable warp specialization for ``tl.range`` loops.

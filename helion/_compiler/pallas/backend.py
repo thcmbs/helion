@@ -295,6 +295,7 @@ class PallasBackend(Backend):
             "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_load_buffer_count",
+            "pallas_fori_loop_unroll_factors",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
         }

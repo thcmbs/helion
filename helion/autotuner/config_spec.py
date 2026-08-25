@@ -516,6 +516,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_load_buffer_count",
+        "pallas_fori_loop_unroll_factors",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "xcd_remap",
@@ -547,6 +548,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_load_buffer_count",
+        "pallas_fori_loop_unroll_factors",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
@@ -563,6 +565,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+# Larger unrolls inflate Mosaic compile time (same reason static ranges gate at 8).
+PALLAS_FORI_UNROLL_CHOICES = (1, 2, 4, 8)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -746,6 +750,9 @@ class ConfigSpec:
             IntegerFragment(1, 2, 1),
             length=0,
         )
+        self.pallas_fori_loop_unroll_factors: BlockIdSequence[
+            PallasForiLoopUnrollFactorSpec
+        ] = BlockIdSequence()
         self.epilogue_subtile_candidate_enabled: bool = False
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
@@ -882,6 +889,17 @@ class ConfigSpec:
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
+        self.pallas_fori_loop_unroll_factors._remove_duplicates()
+
+    def register_pallas_fori_loop(self, *, block_id: int, is_static: bool) -> None:
+        try:
+            spec = self.pallas_fori_loop_unroll_factors.block_id_lookup(block_id)
+        except KeyError:
+            self.pallas_fori_loop_unroll_factors.append(
+                PallasForiLoopUnrollFactorSpec(block_id=block_id, is_static=is_static)
+            )
+        else:
+            spec.is_static = spec.is_static and is_static
 
     def disallow_pid_type(
         self, pid_type: PidTypeLiteral, reason: str | None = None
@@ -2119,6 +2137,21 @@ class ConfigSpec:
         else:
             config.pop("pallas_load_buffer_count", None)
         if (
+            self.supports_config_key("pallas_fori_loop_unroll_factors")
+            and self.has_pallas_inner_loops
+            and config.get("pallas_loop_type") == "fori_loop"
+            and any(spec.is_static for spec in self.pallas_fori_loop_unroll_factors)
+        ):
+            config["pallas_fori_loop_unroll_factors"] = (
+                self.pallas_fori_loop_unroll_factors._normalize(
+                    "pallas_fori_loop_unroll_factors",
+                    config.get("pallas_fori_loop_unroll_factors"),
+                    flatten=True,
+                )
+            )
+        else:
+            config.pop("pallas_fori_loop_unroll_factors", None)
+        if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
             and config.get("pallas_loop_type") not in ("fori_loop", "emit_pipeline")
@@ -2657,6 +2690,14 @@ class ConfigSpec:
         ):
             fields["pallas_load_buffer_count"] = self.pallas_load_buffer_count
         if (
+            self.supports_config_key("pallas_fori_loop_unroll_factors")
+            and self.has_pallas_inner_loops
+            and any(spec.is_static for spec in self.pallas_fori_loop_unroll_factors)
+        ):
+            fields["pallas_fori_loop_unroll_factors"] = (
+                self.pallas_fori_loop_unroll_factors
+            )
+        if (
             self.supports_config_key("pallas_indirect_access_mode")
             and self.pallas_indirect_access_modes
         ):
@@ -2921,6 +2962,7 @@ class ConfigSpec:
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",
+            "pallas_fori_loop_unroll_factors",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -3252,6 +3294,27 @@ class _OptionalBoolSpec(_BlockIdItem):
     def _fill_missing(self) -> None:
         """Provide a value when not provided by the user."""
         return None
+
+
+class PallasForiLoopUnrollFactorSpec(_BlockIdItem):
+    def __init__(self, *, block_id: int, is_static: bool) -> None:
+        super().__init__([block_id])
+        self.is_static = is_static
+
+    def _choices(self) -> tuple[int, ...]:
+        return PALLAS_FORI_UNROLL_CHOICES if self.is_static else (1,)
+
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment(self._choices())
+
+    def _normalize(self, name: str, value: object) -> int:
+        choices = self._choices()
+        if type(value) is not int or value not in choices:
+            raise InvalidConfig(f"{name} must be one of {choices}, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> int:
+        return 1
 
 
 class RangeUnrollFactorSpec(_OptionalIntSpec):
